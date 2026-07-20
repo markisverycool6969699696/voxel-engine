@@ -44,29 +44,38 @@ impl Quad {
     }
 }
 
-/// GPU-ready vertex: world/local-space position, face normal, and a color.
-/// No UV/texture index yet — there's no texture atlas (spec §4.5's item/block
-/// data exists, but atlas assembly doesn't), so [`triangulate`] fills `color`
-/// with a debug placeholder instead. Layout matches the vertex input state
-/// `render-vk`'s pipeline declares — the two must be changed together.
+/// Number of tiles in the placeholder texture atlas (a single row, each tile
+/// square). `render-vk` generates the actual atlas pixels at this same tile
+/// count — the two must be changed together, which is why this lives here
+/// as the one source of truth rather than as a duplicated literal in WGSL.
+pub const ATLAS_TILE_COUNT: u32 = 16;
+
+/// GPU-ready vertex: world/local-space position, face normal, atlas UV, which
+/// atlas tile to sample, and a flat shading multiplier. No real block
+/// textures exist yet — spec §8 lists sourcing a CC0/GPL texture pack as an
+/// open decision — so `render-vk` fills the atlas with procedurally
+/// generated placeholder tiles instead of loading images. Layout matches the
+/// vertex input state `render-vk`'s pipeline declares — the two must be
+/// changed together.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
-    pub color: [f32; 3],
+    /// Unit-square (0/1) corner coordinate *within* the assigned tile — see
+    /// `triangulate`'s doc comment on why a merged quad doesn't tile-repeat.
+    pub uv: [f32; 2],
+    /// Which atlas tile (0..ATLAS_TILE_COUNT) to sample; float because
+    /// vertex attributes are, resolved to an integer offset in the shader.
+    pub tile: f32,
+    pub shade: f32,
 }
 
-/// Deterministic, texture-atlas-free placeholder color per block id (a
-/// stand-in so different block types are visually distinguishable before
-/// real texturing exists — not meant to survive contact with the atlas).
-fn debug_color(block: BlockId) -> [f32; 3] {
-    let h = (block.0 as u32).wrapping_mul(2654435761);
-    [
-        0.35 + 0.55 * ((h & 0xFF) as f32 / 255.0),
-        0.35 + 0.55 * (((h >> 8) & 0xFF) as f32 / 255.0),
-        0.35 + 0.55 * (((h >> 16) & 0xFF) as f32 / 255.0),
-    ]
+/// Deterministic atlas tile index per block id — same "hash the id" idea the
+/// old debug-color placeholder used, just indexing into the atlas instead of
+/// picking a flat color directly.
+fn tile_for_block(block: BlockId) -> f32 {
+    ((block.0 as u32).wrapping_mul(2654435761) % ATLAS_TILE_COUNT) as f32
 }
 
 /// Flat per-face shading: brighter for up-facing quads, darker for
@@ -77,21 +86,28 @@ fn face_shade(normal: [f32; 3]) -> f32 {
 }
 
 /// Triangulates quads into an indexed vertex buffer ((0,1,2),(0,2,3) per
-/// quad, matching [`Quad`]'s documented winding), merging identical vertices
+/// quad, matching [`Quad`]'s documented winding). Merging identical vertices
 /// is deliberately skipped: at chunk-section scale the index buffer savings
 /// don't justify a hash-map pass, and every quad's corners are already
 /// unique to that quad (no shared-vertex smoothing wanted between
-/// differently-shaded/colored faces anyway).
+/// differently-shaded faces anyway).
+///
+/// UV is always the unit square per corner regardless of the quad's merged
+/// size — a texture stretches to fill the whole merged face rather than
+/// repeating once per block. Correct per-block tiling needs the shader to
+/// `fract()` an unwrapped block-space coordinate instead; deliberately
+/// skipped for this placeholder pass (no real textures to tile yet either),
+/// noted here so it isn't mistaken for an oversight later.
 pub fn triangulate(quads: &[Quad]) -> (Vec<MeshVertex>, Vec<u32>) {
+    const UNIT_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     let mut vertices = Vec::with_capacity(quads.len() * 4);
     let mut indices = Vec::with_capacity(quads.len() * 6);
     for quad in quads {
         let base = vertices.len() as u32;
-        let color = debug_color(quad.block);
+        let tile = tile_for_block(quad.block);
         let shade = face_shade(quad.normal);
-        let shaded = [color[0] * shade, color[1] * shade, color[2] * shade];
-        for corner in quad.corners {
-            vertices.push(MeshVertex { position: corner, normal: quad.normal, color: shaded });
+        for (corner, uv) in quad.corners.into_iter().zip(UNIT_UVS) {
+            vertices.push(MeshVertex { position: corner, normal: quad.normal, uv, tile, shade });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -414,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn triangulate_preserves_normals_and_colors_vary_by_block() {
+    fn triangulate_preserves_normals_and_assigns_tile_per_block() {
         // Two synthetic quads (not via greedy_mesh — its output could place
         // adjacent-block quads' corners at the same coordinate, which isn't
         // what this test is checking) with distinct blocks.
@@ -429,8 +445,22 @@ mod tests {
         for v in &vertices[0..4] {
             assert_eq!(v.normal, [0.0, 1.0, 0.0]);
         }
-        assert_ne!(vertices[0].color, vertices[4].color);
-        // All corners of one quad share the same (shaded) color.
-        assert!(vertices[0..4].iter().all(|v| v.color == vertices[0].color));
+        assert_ne!(vertices[0].tile, vertices[4].tile);
+        assert!(vertices[0].tile < ATLAS_TILE_COUNT as f32);
+        // All corners of one quad share the same tile and shade.
+        assert!(vertices[0..4].iter().all(|v| v.tile == vertices[0].tile));
+        assert!(vertices[0..4].iter().all(|v| v.shade == vertices[0].shade));
+    }
+
+    #[test]
+    fn triangulate_uv_is_unit_square_per_corner() {
+        let quad = Quad {
+            corners: [[0.0, 1.0, 0.0], [3.0, 1.0, 0.0], [3.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
+            normal: [0.0, 1.0, 0.0],
+            block: STONE,
+        };
+        let (vertices, _) = triangulate(&[quad]);
+        let uvs: Vec<_> = vertices.iter().map(|v| v.uv).collect();
+        assert_eq!(uvs, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
     }
 }

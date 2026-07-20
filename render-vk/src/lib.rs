@@ -35,6 +35,20 @@
 //!   results set a dirty flag; the next `render_frame` recreates.
 //! - `set_mesh` calls `device_wait_idle` before replacing buffers — correct
 //!   but not meant to be called every frame (no per-frame mesh streaming yet).
+//!
+//! Checkpoint 4: a placeholder texture atlas. No real block textures exist
+//! (spec §8: sourcing a CC0/GPL texture pack is still an open decision), so
+//! `generate_atlas_pixels` procedurally generates one instead of loading
+//! image files — deliberately zero new dependencies here (no image-decoding
+//! crate), partly because the previous attempt at a new dependency (`rodio`
+//! for sound) crashed the whole binary at link time on this project's GNU
+//! toolchain (see MEMORY.md) and this avoids repeating that risk. The atlas
+//! is uploaded once at init via a staging buffer + one-shot command buffer
+//! (`create_atlas`), matching the standard device-local-image upload pattern.
+//! Texture + sampler are separate descriptor bindings (WGSL has no combined-
+//! image-sampler type; naga's SPIR-V backend emits separate
+//! `SAMPLED_IMAGE`/`SAMPLER` descriptors for `texture_2d`/`sampler`, so the
+//! Vulkan-side layout mirrors that rather than fighting it).
 
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
@@ -47,7 +61,7 @@ use vk_mem::{Alloc, AllocationCreateFlags, AllocationCreateInfo, Allocator, Allo
 use winit::window::Window;
 
 use engine_core::camera::Camera;
-use engine_core::mesh::MeshVertex;
+use engine_core::mesh::{MeshVertex, ATLAS_TILE_COUNT};
 use engine_core::Renderer;
 
 mod shader;
@@ -61,6 +75,54 @@ const DEPTH_FORMAT_CANDIDATES: [vk::Format; 3] = [
     vk::Format::D24_UNORM_S8_UINT,
     vk::Format::D16_UNORM,
 ];
+const ATLAS_TILE_SIZE: u32 = 16;
+/// `R8G8B8A8_UNORM` is one of Vulkan's mandatory-support formats for
+/// sampled + transfer-dst optimal-tiling images, unlike the depth format —
+/// no capability query needed.
+const ATLAS_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+/// Host-side mirror of `mesh.wgsl`'s `Globals` uniform struct. WGSL's
+/// uniform-address-space layout rules require the struct's total size be a
+/// multiple of its largest member's alignment (16, from `mat4x4<f32>`);
+/// `_pad` makes that explicit here instead of relying on `#[repr(C)]` to
+/// happen to match (64 + 4 = 68, padded to 80).
+#[repr(C)]
+struct GlobalsUbo {
+    view_proj: [f32; 16],
+    atlas_tile_count: f32,
+    _pad: [f32; 3],
+}
+
+/// Procedurally generates a single-row atlas: `ATLAS_TILE_COUNT` tiles of
+/// `ATLAS_TILE_SIZE`² pixels, each a hashed base color with a coarse 4x4
+/// checker so it reads as "textured" rather than a flat swatch — same
+/// "hash the id" idea the pre-atlas debug coloring used, just baked into
+/// pixels instead of a per-vertex color.
+fn generate_atlas_pixels() -> Vec<u8> {
+    let (width, height) = (ATLAS_TILE_COUNT * ATLAS_TILE_SIZE, ATLAS_TILE_SIZE);
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for tile in 0..ATLAS_TILE_COUNT {
+        let h = tile.wrapping_mul(2654435761);
+        let base = [
+            80 + (h & 0x7F) as u8,
+            80 + ((h >> 8) & 0x7F) as u8,
+            80 + ((h >> 16) & 0x7F) as u8,
+        ];
+        for y in 0..ATLAS_TILE_SIZE {
+            for x in 0..ATLAS_TILE_SIZE {
+                let darker = ((x / 4) + (y / 4)) % 2 == 0;
+                let mul = if darker { 0.75 } else { 1.0 };
+                let px = tile * ATLAS_TILE_SIZE + x;
+                let idx = ((y * width + px) * 4) as usize;
+                pixels[idx] = (base[0] as f32 * mul) as u8;
+                pixels[idx + 1] = (base[1] as f32 * mul) as u8;
+                pixels[idx + 2] = (base[2] as f32 * mul) as u8;
+                pixels[idx + 3] = 255;
+            }
+        }
+    }
+    pixels
+}
 
 struct FrameSync {
     image_available: vk::Semaphore,
@@ -100,6 +162,13 @@ pub struct VkRenderer {
     command_pool: vk::CommandPool,
     frames: Vec<FrameSync>,
     frame_index: usize,
+
+    // Placeholder texture atlas: created once in `create_atlas`, immutable
+    // thereafter (no swapchain dependency, unlike the depth buffer).
+    atlas_image: vk::Image,
+    atlas_allocation: vk_mem::Allocation,
+    atlas_view: vk::ImageView,
+    atlas_sampler: vk::Sampler,
 
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
@@ -263,6 +332,10 @@ impl VkRenderer {
                 command_pool,
                 frames,
                 frame_index: 0,
+                atlas_image: vk::Image::null(),
+                atlas_allocation: std::mem::zeroed(),
+                atlas_view: vk::ImageView::null(),
+                atlas_sampler: vk::Sampler::null(),
                 descriptor_set_layout: vk::DescriptorSetLayout::null(),
                 descriptor_pool: vk::DescriptorPool::null(),
                 uniform_buffers: Vec::new(),
@@ -277,6 +350,7 @@ impl VkRenderer {
                 mesh_index_count: 0,
                 swapchain_dirty: false,
             };
+            renderer.create_atlas()?;
             renderer.create_globals()?;
             renderer.create_swapchain()?;
             renderer.create_pipeline()?;
@@ -284,29 +358,168 @@ impl VkRenderer {
         }
     }
 
-    /// One-time setup independent of the swapchain: the per-frame uniform
-    /// buffers holding the camera matrix, and the descriptor plumbing to
-    /// bind them. Must run before `create_pipeline` (the pipeline layout
-    /// references `descriptor_set_layout`).
-    fn create_globals(&mut self) -> Result<()> {
+    /// Uploads the procedurally generated placeholder atlas (see module
+    /// docs) to a device-local image via a staging buffer + one-shot command
+    /// buffer. Runs once at init, before `create_globals` (which binds the
+    /// resulting view/sampler into every frame's descriptor set) — no
+    /// swapchain dependency, so unlike the depth buffer this never recreates.
+    fn create_atlas(&mut self) -> Result<()> {
         unsafe {
-            let binding = vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX);
-            self.descriptor_set_layout = self.device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default()
-                    .bindings(std::slice::from_ref(&binding)),
+            let pixels = generate_atlas_pixels();
+            let (width, height) = (ATLAS_TILE_COUNT * ATLAS_TILE_SIZE, ATLAS_TILE_SIZE);
+            let (staging_buffer, mut staging_alloc) =
+                self.create_mapped_buffer_with_data(&pixels, vk::BufferUsageFlags::TRANSFER_SRC)?;
+
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(ATLAS_FORMAT)
+                .extent(vk::Extent3D { width, height, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let alloc_info =
+                AllocationCreateInfo { usage: MemoryUsage::AutoPreferDevice, ..Default::default() };
+            let (image, allocation) = self
+                .allocator
+                .create_image(&image_info, &alloc_info)
+                .context("failed to create atlas image")?;
+
+            let cmd = self.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            image_barrier(
+                &self.device,
+                cmd,
+                image,
+                vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D { width, height, depth: 1 });
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+            image_barrier(
+                &self.device,
+                cmd,
+                image,
+                vk::ImageAspectFlags::COLOR,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+            self.device.end_command_buffer(cmd)?;
+            let cmd_info = vk::CommandBufferSubmitInfo::default().command_buffer(cmd);
+            let submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(std::slice::from_ref(&cmd_info));
+            self.device
+                .queue_submit2(self.queue, std::slice::from_ref(&submit), vk::Fence::null())?;
+            // One-time init cost: simplicity (no fence bookkeeping) over the
+            // perf that would matter if this ran every frame, which it doesn't.
+            self.device.queue_wait_idle(self.queue)?;
+            self.device.free_command_buffers(self.command_pool, &[cmd]);
+            self.allocator.destroy_buffer(staging_buffer, &mut staging_alloc);
+
+            let view = self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(ATLAS_FORMAT)
+                    .subresource_range(aspect_subresource_range(vk::ImageAspectFlags::COLOR)),
+                None,
+            )?;
+            let sampler = self.device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_w(vk::SamplerAddressMode::REPEAT),
                 None,
             )?;
 
-            let pool_size = vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(FRAMES_IN_FLIGHT as u32);
+            self.atlas_image = image;
+            self.atlas_allocation = allocation;
+            self.atlas_view = view;
+            self.atlas_sampler = sampler;
+            Ok(())
+        }
+    }
+
+    /// One-time setup independent of the swapchain: the per-frame uniform
+    /// buffers holding the camera matrix + atlas tile count, the atlas
+    /// texture/sampler bindings, and the descriptor plumbing to bind them
+    /// all. Must run after `create_atlas` (needs its view/sampler) and
+    /// before `create_pipeline` (the pipeline layout references
+    /// `descriptor_set_layout`).
+    fn create_globals(&mut self) -> Result<()> {
+        unsafe {
+            let ubo_binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
+            let image_binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+            let sampler_binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+            let bindings = [ubo_binding, image_binding, sampler_binding];
+            self.descriptor_set_layout = self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?;
+
+            let pool_sizes = [
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(FRAMES_IN_FLIGHT as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(FRAMES_IN_FLIGHT as u32),
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(FRAMES_IN_FLIGHT as u32),
+            ];
             self.descriptor_pool = self.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .pool_sizes(std::slice::from_ref(&pool_size))
+                    .pool_sizes(&pool_sizes)
                     .max_sets(FRAMES_IN_FLIGHT as u32),
                 None,
             )?;
@@ -318,22 +531,38 @@ impl VkRenderer {
                     .set_layouts(&layouts),
             )?;
 
-            let matrix_size = std::mem::size_of::<[f32; 16]>() as vk::DeviceSize;
+            let ubo_size = std::mem::size_of::<GlobalsUbo>() as vk::DeviceSize;
+            let image_info = vk::DescriptorImageInfo::default()
+                .image_view(self.atlas_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            let sampler_info = vk::DescriptorImageInfo::default().sampler(self.atlas_sampler);
             for i in 0..FRAMES_IN_FLIGHT {
                 let (buffer, allocation) = self.create_mapped_buffer_sized(
-                    matrix_size,
+                    ubo_size,
                     vk::BufferUsageFlags::UNIFORM_BUFFER,
                 )?;
                 let buffer_info = vk::DescriptorBufferInfo::default()
                     .buffer(buffer)
                     .offset(0)
-                    .range(matrix_size);
-                let write = vk::WriteDescriptorSet::default()
-                    .dst_set(self.descriptor_sets[i])
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .buffer_info(std::slice::from_ref(&buffer_info));
-                self.device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
+                    .range(ubo_size);
+                let writes = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_sets[i])
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(std::slice::from_ref(&buffer_info)),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_sets[i])
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(std::slice::from_ref(&image_info)),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_sets[i])
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(std::slice::from_ref(&sampler_info)),
+                ];
+                self.device.update_descriptor_sets(&writes, &[]);
                 self.uniform_buffers.push(buffer);
                 self.uniform_allocations.push(allocation);
             }
@@ -441,8 +670,18 @@ impl VkRenderer {
                 vk::VertexInputAttributeDescription::default()
                     .location(2)
                     .binding(0)
-                    .format(vk::Format::R32G32B32_SFLOAT)
-                    .offset(std::mem::offset_of!(MeshVertex, color) as u32),
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .offset(std::mem::offset_of!(MeshVertex, uv) as u32),
+                vk::VertexInputAttributeDescription::default()
+                    .location(3)
+                    .binding(0)
+                    .format(vk::Format::R32_SFLOAT)
+                    .offset(std::mem::offset_of!(MeshVertex, tile) as u32),
+                vk::VertexInputAttributeDescription::default()
+                    .location(4)
+                    .binding(0)
+                    .format(vk::Format::R32_SFLOAT)
+                    .offset(std::mem::offset_of!(MeshVertex, shade) as u32),
             ];
             let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(std::slice::from_ref(&binding_desc))
@@ -721,13 +960,18 @@ impl VkRenderer {
                 vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
             );
 
-            // Camera matrix for this frame slot. flush_allocation is a no-op
-            // on coherent memory (the common case); see create_mapped_buffer_with_data.
-            let view_proj = camera.view_proj().to_cols_array();
+            // Camera matrix + atlas tile count for this frame slot.
+            // flush_allocation is a no-op on coherent memory (the common
+            // case); see create_mapped_buffer_with_data.
+            let globals = GlobalsUbo {
+                view_proj: camera.view_proj().to_cols_array(),
+                atlas_tile_count: ATLAS_TILE_COUNT as f32,
+                _pad: [0.0; 3],
+            };
             let ubo_alloc = &self.uniform_allocations[self.frame_index];
             let mapped = self.allocator.get_allocation_info(ubo_alloc).mapped_data;
             debug_assert!(!mapped.is_null());
-            std::ptr::copy_nonoverlapping(view_proj.as_ptr(), mapped as *mut f32, view_proj.len());
+            std::ptr::copy_nonoverlapping(&globals, mapped as *mut GlobalsUbo, 1);
             self.allocator.flush_allocation(ubo_alloc, 0, vk::WHOLE_SIZE)?;
 
             let color_attachment = vk::RenderingAttachmentInfo::default()
@@ -951,6 +1195,10 @@ impl Drop for VkRenderer {
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+
+            self.device.destroy_sampler(self.atlas_sampler, None);
+            self.device.destroy_image_view(self.atlas_view, None);
+            self.allocator.destroy_image(self.atlas_image, &mut self.atlas_allocation);
 
             for frame in &self.frames {
                 self.device.destroy_semaphore(frame.image_available, None);

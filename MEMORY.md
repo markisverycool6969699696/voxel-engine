@@ -158,9 +158,34 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   in case a specific version is the culprit — untested, no strong reason to expect it fixes the
   ABI-level issue though.
 
+- **Checkpoint 10 — DONE, confirmed (Sonnet):** placeholder texture atlas. No real block textures
+  exist (spec §8 open decision), so `render-vk::generate_atlas_pixels` procedurally generates a
+  16-tile atlas (hashed base color per tile + coarse 4x4 checker so it reads as "textured") instead
+  of loading images — deliberately zero new external crates, given the `rodio` incident just above.
+  - `engine_core::mesh`: `MeshVertex.color` replaced with `uv`/`tile`/`shade`; `ATLAS_TILE_COUNT`
+    constant is the single source of truth both crates read (no duplicated magic number between
+    Rust and WGSL). UV is always the unit square per corner — texture stretches across a merged
+    quad rather than repeating per-block; documented as a deliberate simplification, not an
+    oversight (correct per-block tiling needs shader-side `fract()`, skipped for this pass).
+  - `render-vk`: atlas image uploaded once at init via staging buffer + one-shot command buffer
+    (standard device-local-image pattern); texture + sampler are **separate** descriptor bindings
+    (`SAMPLED_IMAGE` + `SAMPLER`), not a combined-image-sampler — WGSL/naga has no combined type,
+    so the Vulkan layout mirrors what naga's SPIR-V backend actually emits rather than fighting it.
+    Descriptor set layout/pool grew from 1 to 3 bindings; `GlobalsUbo` (Rust-side mirror of the WGSL
+    `Globals` struct) now carries `atlas_tile_count` alongside `view_proj`, padded to 80 bytes to
+    match WGSL's uniform-layout size rules explicitly rather than hoping `#[repr(C)]` happens to
+    agree. `mesh.wgsl` rewritten: samples `atlas_tex` at `(tile + uv.x) / atlas_tile_count, uv.y`.
+  - 57/57 engine-core tests pass, workspace builds clean zero warnings.
+  - **Hit an unrelated environment blocker while verifying this**: Windows Smart App Control
+    started blocking `game.exe` from running at all ("Application Control policy has blocked this
+    file") — not a code issue, confirmed via `cargo build`/`test` staying clean throughout. User
+    resolved it (turned off Smart App Control). **After that, runtime-confirmed working**: 6s soak,
+    no crash, no Vulkan validation errors, GPU detected correctly. Visual "does it actually look
+    textured" confirmation from the user is still open (only crash/validation-error checked here).
+
 - **Repo state:** pushed to GitHub — https://github.com/markisverycool6969699696/voxel-engine
-  (public, AGPLv3). Initial commit covers checkpoints 1-8. Checkpoint 9 (this culling change) and
-  the sound-integration attempt/revert are **not yet committed**.
+  (public, AGPLv3). Initial commit + checkpoint 9 (culling) are on `origin/master`. Checkpoint 10
+  (this texture atlas work) is **not yet committed**.
 
 ## Environment Notes
 - No MSVC Build Tools on this machine → using `stable-x86_64-pc-windows-gnu` toolchain.
@@ -176,24 +201,19 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   `x86_64-w64-mingw32-gcc -print-file-name=libc++.a` if so.
 
 ## Next Up
-Core loop confirmed working (move/look/mine/place), back-face culling now on. Candidate next
-Sonnet-tier work — none of these require Opus:
-1. Commit + push checkpoint 9 (culling) and the sound-integration revert (currently uncommitted
-   local changes only).
-2. **Sound integration is blocked**, not just "not started" — see the entry above before
+Core loop confirmed working (move/look/mine/place), back-face culling on, placeholder texture
+atlas rendering (crash-free; not yet visually eyeballed). Candidate next Sonnet-tier work — none
+of these require Opus:
+1. Commit + push checkpoint 10 (texture atlas) — currently uncommitted local changes only.
+2. **Sound integration is blocked**, not just "not started" — see checkpoint 8's entry before
    attempting again. The likely real fix is installing MSVC Build Tools and switching off the GNU
    toolchain, which is a bigger environment change worth flagging/confirming with the user rather
    than doing unilaterally.
-3. Texture atlas infrastructure (combined image sampler, UV in `triangulate`) using a
-   procedurally-generated placeholder atlas — same licensing-avoidance reasoning sound used
-   (no CC0/GPL asset pack sourced yet per STARTER.md §8). Not known to hit the same GNU-toolchain
-   risk sound did (image loading doesn't need `windows-rs` COM bindings the way `cpal` does), but
-   worth linking-in early and smoke-testing before writing much code against it, given what just
-   happened.
-4. Wiring `engine_core::streaming::ChunkManager` into `game/src/main.rs` for a multi-chunk world.
+3. Wiring `engine_core::streaming::ChunkManager` into `game/src/main.rs` for a multi-chunk world.
    Caution: needs *some* `ChunkGenerator` to produce content, and deciding what a chunk generator
    should output is real world-gen content — that's Opus's call per the tiering plan, not something
-   to improvise here even as a "placeholder."
+   to improvise here even as a "placeholder." **This is likely the last Sonnet-tier item before
+   the project genuinely needs Opus for world generation.**
 
 Real world generation (terrain gen pipeline, biome blending) is Opus-tier per the project's own
-AI-tiering plan — flag it, don't build it, when this list is exhausted.
+AI-tiering plan — flag it, don't build it, once item 3 above is reached.
