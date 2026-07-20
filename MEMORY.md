@@ -188,10 +188,11 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   diagnosis: install MSVC Build Tools and get off the GNU/LLVM-MinGW toolchain, since
   `windows-rs` (pulled in by `rodio`'s `cpal` dependency) targets MSVC ABI.
   - `winget install --id Microsoft.VisualStudio.2022.BuildTools` (with the
-    `Microsoft.VisualStudio.Workload.VCTools` override) was kicked off in the background — **as of
-    this entry, still installing** (multi-GB download, hadn't progressed past "Starting package
-    install..." after several minutes). Check `Get-Command link.exe` / `cl.exe` to see if it's
-    finished by the time this is picked up again.
+    `Microsoft.VisualStudio.Workload.VCTools` override) **finished successfully** (background task
+    completion notification, exit code 0) shortly after this entry was first written — but the
+    session paused for usage limits right after, so `link.exe`/`cl.exe` availability and the actual
+    MSVC toolchain switch are still unverified. Confirm `Get-Command link.exe` / `cl.exe` before
+    assuming this is actually ready to use.
   - Audio code (`game/src/audio.rs`, the `rodio` dependency, and the wiring into
     `game/src/main.rs` — mod declaration, `audio: Option<Audio>` field, `Audio::new()` in
     `App::default`, `play_mine()`/`play_place()` at the two mine/place edit sites) was re-added
