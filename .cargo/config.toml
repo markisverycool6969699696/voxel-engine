@@ -1,0 +1,11 @@
+# The system mingw is LLVM-MinGW (clang/lld) without GCC runtime libs;
+# use the CRT objects and libgcc shipped with rustup's rust-mingw component.
+# -lc++ is needed because vk-mem links a C++ (VMA) object built by this same
+# LLVM-MinGW toolchain, which uses libc++ (std::__1::...), not libstdc++ —
+# rustc's default windows-gnu link args only add -lstdc++.
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "link-self-contained=yes",
+    "-C", "link-arg=-Lc:/Users/mark2/AppData/Local/Microsoft/WinGet/Packages/MartinStorsjo.LLVM-MinGW.MSVCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/llvm-mingw-20260602-msvcrt-x86_64/x86_64-w64-mingw32/lib",
+    "-C", "link-arg=-lc++",
+]

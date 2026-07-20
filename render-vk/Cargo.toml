@@ -1,0 +1,15 @@
+[package]
+name = "render-vk"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+anyhow = { workspace = true }
+ash = { workspace = true }
+ash-window = { workspace = true }
+raw-window-handle = { workspace = true }
+winit = { workspace = true }
+naga = { version = "30.0.0", features = ["wgsl-in", "spv-out"] }
+vk-mem = "0.5.0"

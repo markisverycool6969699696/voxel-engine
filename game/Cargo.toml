@@ -1,0 +1,12 @@
+[package]
+name = "game"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+render-vk = { path = "../render-vk" }
+anyhow = { workspace = true }
+glam = { workspace = true }
+winit = { workspace = true }

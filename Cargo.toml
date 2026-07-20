@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["engine-core", "render-vk", "game"]
+
+[workspace.dependencies]
+anyhow = "1"
+ash = "0.38"
+ash-window = "0.13"
+glam = "0.30"
+raw-window-handle = "0.6"
+winit = "0.30"
