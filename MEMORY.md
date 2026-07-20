@@ -183,12 +183,46 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     no crash, no Vulkan validation errors, GPU detected correctly. Visual "does it actually look
     textured" confirmation from the user is still open (only crash/validation-error checked here).
 
+- **Sound integration, attempt 2 — STARTED THEN DELIBERATELY REVERTED FOR STABILITY (Sonnet):**
+  user wants sound fixed properly ("we need full stable base"). Real fix per checkpoint 8's
+  diagnosis: install MSVC Build Tools and get off the GNU/LLVM-MinGW toolchain, since
+  `windows-rs` (pulled in by `rodio`'s `cpal` dependency) targets MSVC ABI.
+  - `winget install --id Microsoft.VisualStudio.2022.BuildTools` (with the
+    `Microsoft.VisualStudio.Workload.VCTools` override) was kicked off in the background — **as of
+    this entry, still installing** (multi-GB download, hadn't progressed past "Starting package
+    install..." after several minutes). Check `Get-Command link.exe` / `cl.exe` to see if it's
+    finished by the time this is picked up again.
+  - Audio code (`game/src/audio.rs`, the `rodio` dependency, and the wiring into
+    `game/src/main.rs` — mod declaration, `audio: Option<Audio>` field, `Audio::new()` in
+    `App::default`, `play_mine()`/`play_place()` at the two mine/place edit sites) was re-added
+    ahead of the toolchain being ready, so it would be a quick rebuild+test once unblocked.
+  - **Deliberately reverted before pausing** rather than leave it sitting uncommitted and
+    untested: with the Build Tools install not yet done, "sound might work" wasn't a fact, and the
+    user explicitly asked to make sure everything works, not to leave something half-verified.
+    `game/src/audio.rs` deleted, `game/Cargo.toml` and `game/src/main.rs` restored via
+    `git restore` to exactly match `origin/master`. Re-verified after reverting: clean build,
+    57/57 tests, 6s runtime soak with no crash/validation errors — **confirmed back to the same
+    known-good state as the last commit**, nothing regressed by the attempt.
+  - **To resume:** once VS Build Tools finishes, switch this project's toolchain to MSVC
+    (prefer a repo-local `rustup override set stable-x86_64-pc-windows-msvc`, not the global
+    rustup default, since other GNU-dependent work may exist elsewhere on this machine), confirm
+    the existing (non-audio) build/tests/runtime still work under MSVC first, *then* re-apply the
+    audio changes (same shape as described above — nothing conceptually new to figure out, just
+    needs the working toolchain) and verify specifically that `cpal`/`windows-rs` no longer
+    crashes the binary. If it still crashes under MSVC too, that disproves the toolchain theory —
+    don't assume MSVC is a guaranteed fix without checking.
+  - Also unverified: `.cargo/config.toml`'s GNU-target rustflags are scoped under
+    `[target.x86_64-pc-windows-gnu]` so they shouldn't affect an MSVC build, but that assumption
+    hasn't actually been checked yet either.
+
 - **Repo state:** pushed to GitHub — https://github.com/markisverycool6969699696/voxel-engine
-  (public, AGPLv3). Initial commit + checkpoint 9 (culling) are on `origin/master`. Checkpoint 10
-  (this texture atlas work) is **not yet committed**.
+  (public, AGPLv3). `origin/master` and the local working tree match exactly — everything through
+  checkpoint 10 (texture atlas) is committed, pushed, and freshly re-verified working (clean
+  build, 57/57 tests, no-crash runtime soak). No uncommitted or in-flight changes.
 
 ## Environment Notes
 - No MSVC Build Tools on this machine → using `stable-x86_64-pc-windows-gnu` toolchain.
+  **(In progress, see above: this may change if the MSVC toolchain switch for sound succeeds.)**
 - System mingw (LLVM-MinGW) lacks GCC runtime libs → `.cargo/config.toml` sets
   `link-self-contained=yes` to pull them from rustup's `rust-mingw` component instead.
 - No Vulkan SDK installed → shaders are WGSL, compiled in-process via `naga`, not glslc.
@@ -201,19 +235,19 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   `x86_64-w64-mingw32-gcc -print-file-name=libc++.a` if so.
 
 ## Next Up
-Core loop confirmed working (move/look/mine/place), back-face culling on, placeholder texture
-atlas rendering (crash-free; not yet visually eyeballed). Candidate next Sonnet-tier work — none
-of these require Opus:
-1. Commit + push checkpoint 10 (texture atlas) — currently uncommitted local changes only.
-2. **Sound integration is blocked**, not just "not started" — see checkpoint 8's entry before
-   attempting again. The likely real fix is installing MSVC Build Tools and switching off the GNU
-   toolchain, which is a bigger environment change worth flagging/confirming with the user rather
-   than doing unilaterally.
-3. Wiring `engine_core::streaming::ChunkManager` into `game/src/main.rs` for a multi-chunk world.
+**Resume here first**: the in-progress sound/MSVC toolchain switch above. As of the pause,
+`winget install ... Microsoft.VisualStudio.2022.BuildTools` had only printed "Starting package
+install..." — likely still mid-install (it's a multi-GB download+install, can take 15-20+ min).
+Check whether it finished (`Get-Command link.exe`), and if the background shell task is still
+listed as running, before doing anything else with the toolchain.
+
+After that's resolved (working or not), remaining Sonnet-tier work — none of these require Opus:
+1. Commit + push once sound is confirmed working (or confirmed still blocked, with findings noted).
+2. Wiring `engine_core::streaming::ChunkManager` into `game/src/main.rs` for a multi-chunk world.
    Caution: needs *some* `ChunkGenerator` to produce content, and deciding what a chunk generator
    should output is real world-gen content — that's Opus's call per the tiering plan, not something
    to improvise here even as a "placeholder." **This is likely the last Sonnet-tier item before
    the project genuinely needs Opus for world generation.**
 
 Real world generation (terrain gen pipeline, biome blending) is Opus-tier per the project's own
-AI-tiering plan — flag it, don't build it, once item 3 above is reached.
+AI-tiering plan — flag it, don't build it, once item 2 above is reached.
