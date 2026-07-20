@@ -128,7 +128,39 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   - Paused after this to get user visual confirmation before stacking more systems on unverified
     rendering — see the confirmation entry above. That gate has now passed.
 
-- **Repo state:** git initialized, nothing committed yet.
+- **Checkpoint 9 — DONE (Sonnet):** back-face culling enabled (`CullModeFlags::BACK` +
+  `FrontFace::CLOCKWISE` in `render-vk/src/lib.rs`'s pipeline). Was left off since checkpoint 3
+  pending visual confirmation of the winding math; that confirmation happened (checkpoint 8's
+  entry above), so this is now a pure perf win. Not yet independently re-confirmed visually with
+  culling specifically on — nothing should disappear if the reasoning holds, worth a glance.
+
+- **Sound integration — BLOCKED, reverted (Sonnet):** attempted `rodio` 0.22 (procedurally
+  synthesized tones for mine/place feedback — no sound assets exist, so this avoided the
+  asset-licensing decision STARTER.md §8 leaves open, same reasoning as the debug block colors).
+  Implementation was code-complete and built clean, but **crashed the whole game on launch**
+  (`STATUS_ACCESS_VIOLATION`, `cargo build` succeeds, event log shows the fault inside `game.exe`
+  itself, offset ~0xc8xxxx, "unknown" faulting module). Isolated by bisection: crash reproduces even
+  with `Audio::new()` never called — merely *linking* `rodio`'s `cpal`→`windows` (v0.62.2)
+  dependency into the binary is enough to crash at/near process startup, before `main()`'s own logic
+  runs. Removing the `rodio` dependency entirely (confirmed via a clean rebuild) restores the known-
+  good, crash-free build. Root cause is almost certainly this project's unusual toolchain (see
+  Environment Notes: no MSVC Build Tools, `stable-x86_64-pc-windows-gnu` + LLVM-MinGW +
+  `link-self-contained` + manual `-lc++`) being incompatible with `windows-rs` v0.62's Windows API
+  bindings on the GNU target — `windows-rs` has historically had GNU-target ABI issues (COM
+  vtables, exception handling assume MSVC conventions). **Fully reverted**: `game/src/audio.rs`
+  deleted, all call sites removed, `rodio` dependency line removed from `game/Cargo.toml`,
+  `Cargo.lock` regenerated via clean rebuild. engine-core's 56 tests still pass, workspace builds
+  clean with zero warnings, runtime soak confirms no crash.
+  **To revisit sound:** either (a) get MSVC Build Tools installed and switch to the
+  `stable-x86_64-pc-windows-msvc` toolchain (removes the underlying GNU-target-ABI risk entirely,
+  and was the original recommended path before the GNU toolchain was chosen for expedience), or
+  (b) try `kira` (the spec's other suggested audio crate) or an older `cpal`/`windows` version
+  in case a specific version is the culprit — untested, no strong reason to expect it fixes the
+  ABI-level issue though.
+
+- **Repo state:** pushed to GitHub — https://github.com/markisverycool6969699696/voxel-engine
+  (public, AGPLv3). Initial commit covers checkpoints 1-8. Checkpoint 9 (this culling change) and
+  the sound-integration attempt/revert are **not yet committed**.
 
 ## Environment Notes
 - No MSVC Build Tools on this machine → using `stable-x86_64-pc-windows-gnu` toolchain.
@@ -144,15 +176,20 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   `x86_64-w64-mingw32-gcc -print-file-name=libc++.a` if so.
 
 ## Next Up
-Core loop confirmed working (move/look/mine/place). Candidate next Sonnet-tier work, in rough
-value order — none of these require Opus:
-1. Sound integration (rodio/kira) via a placeholder procedural sound (e.g. a synthesized click on
-   mine/place) — avoids the asset-licensing/sourcing decision (STARTER.md §8, not yet made) while
-   still delivering the real subsystem.
-2. Texture atlas infrastructure (combined image sampler, UV in `triangulate`) using a
-   procedurally-generated placeholder atlas, same licensing-avoidance reasoning as sound.
-3. Enable back-face culling (`CullModeFlags::BACK` + already-correct `FrontFace::CLOCKWISE`) now
-   that rendering is confirmed correct — pure perf, verify visually after flipping it.
+Core loop confirmed working (move/look/mine/place), back-face culling now on. Candidate next
+Sonnet-tier work — none of these require Opus:
+1. Commit + push checkpoint 9 (culling) and the sound-integration revert (currently uncommitted
+   local changes only).
+2. **Sound integration is blocked**, not just "not started" — see the entry above before
+   attempting again. The likely real fix is installing MSVC Build Tools and switching off the GNU
+   toolchain, which is a bigger environment change worth flagging/confirming with the user rather
+   than doing unilaterally.
+3. Texture atlas infrastructure (combined image sampler, UV in `triangulate`) using a
+   procedurally-generated placeholder atlas — same licensing-avoidance reasoning sound used
+   (no CC0/GPL asset pack sourced yet per STARTER.md §8). Not known to hit the same GNU-toolchain
+   risk sound did (image loading doesn't need `windows-rs` COM bindings the way `cpal` does), but
+   worth linking-in early and smoke-testing before writing much code against it, given what just
+   happened.
 4. Wiring `engine_core::streaming::ChunkManager` into `game/src/main.rs` for a multi-chunk world.
    Caution: needs *some* `ChunkGenerator` to produce content, and deciding what a chunk generator
    should output is real world-gen content — that's Opus's call per the tiering plan, not something

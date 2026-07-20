@@ -14,14 +14,16 @@
 //! practice); `render_frame` takes an `engine_core::camera::Camera` and
 //! writes its view-projection matrix into a per-frame uniform buffer bound
 //! via a descriptor set. Added a depth buffer (recreated alongside the
-//! swapchain) with standard less-than depth testing. Back-face culling is
-//! deliberately left **off** (`CullModeFlags::NONE`) even though the winding
-//! math says `FrontFace::CLOCKWISE` should be correct for
-//! CCW-from-outside-wound quads run through our Y-flipped Vulkan projection
-//! (see `engine_core::camera` docs) — that reasoning hasn't been checked
-//! against an actual rendered frame yet, and a wrong culling direction fails
-//! silently (blank screen, no validation error, easy to mistake for an
-//! unrelated bug). Flip it on once someone's looked at a real frame.
+//! swapchain) with standard less-than depth testing.
+//!
+//! Back-face culling (`FrontFace::CLOCKWISE` + `CullModeFlags::BACK`) is now
+//! enabled. The winding math it depends on (CCW-from-outside-wound quads
+//! through our Y-flipped Vulkan projection, see `engine_core::camera` docs)
+//! was reasoned through and the *scene without culling* was user-confirmed
+//! rendering correctly, which is strong evidence the winding direction is
+//! right — but culling being *on* specifically has not itself been visually
+//! re-checked yet (nothing here should ever disappear if it's correct; if
+//! geometry vanishes or looks inside-out, that's this line).
 //!
 //! Sync design (the part that must be right):
 //! - `FRAMES_IN_FLIGHT = 2` frames, each with its own command buffer,
@@ -456,10 +458,11 @@ impl VkRenderer {
                 .viewport_count(1)
                 .scissor_count(1);
 
-            // cull_mode NONE deliberately — see module docs on the winding/culling risk.
+            // See module docs: culling direction depends on the Y-flip in
+            // engine_core::camera's projection matrix.
             let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::NONE)
+                .cull_mode(vk::CullModeFlags::BACK)
                 .front_face(vk::FrontFace::CLOCKWISE)
                 .line_width(1.0);
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
