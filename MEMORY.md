@@ -183,47 +183,49 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     no crash, no Vulkan validation errors, GPU detected correctly. Visual "does it actually look
     textured" confirmation from the user is still open (only crash/validation-error checked here).
 
-- **Sound integration, attempt 2 — STARTED THEN DELIBERATELY REVERTED FOR STABILITY (Sonnet):**
-  user wants sound fixed properly ("we need full stable base"). Real fix per checkpoint 8's
-  diagnosis: install MSVC Build Tools and get off the GNU/LLVM-MinGW toolchain, since
-  `windows-rs` (pulled in by `rodio`'s `cpal` dependency) targets MSVC ABI.
-  - `winget install --id Microsoft.VisualStudio.2022.BuildTools` (with the
-    `Microsoft.VisualStudio.Workload.VCTools` override) **finished successfully** (background task
-    completion notification, exit code 0) shortly after this entry was first written — but the
-    session paused for usage limits right after, so `link.exe`/`cl.exe` availability and the actual
-    MSVC toolchain switch are still unverified. Confirm `Get-Command link.exe` / `cl.exe` before
-    assuming this is actually ready to use.
-  - Audio code (`game/src/audio.rs`, the `rodio` dependency, and the wiring into
-    `game/src/main.rs` — mod declaration, `audio: Option<Audio>` field, `Audio::new()` in
-    `App::default`, `play_mine()`/`play_place()` at the two mine/place edit sites) was re-added
-    ahead of the toolchain being ready, so it would be a quick rebuild+test once unblocked.
-  - **Deliberately reverted before pausing** rather than leave it sitting uncommitted and
-    untested: with the Build Tools install not yet done, "sound might work" wasn't a fact, and the
-    user explicitly asked to make sure everything works, not to leave something half-verified.
-    `game/src/audio.rs` deleted, `game/Cargo.toml` and `game/src/main.rs` restored via
-    `git restore` to exactly match `origin/master`. Re-verified after reverting: clean build,
-    57/57 tests, 6s runtime soak with no crash/validation errors — **confirmed back to the same
-    known-good state as the last commit**, nothing regressed by the attempt.
-  - **To resume:** once VS Build Tools finishes, switch this project's toolchain to MSVC
-    (prefer a repo-local `rustup override set stable-x86_64-pc-windows-msvc`, not the global
-    rustup default, since other GNU-dependent work may exist elsewhere on this machine), confirm
-    the existing (non-audio) build/tests/runtime still work under MSVC first, *then* re-apply the
-    audio changes (same shape as described above — nothing conceptually new to figure out, just
-    needs the working toolchain) and verify specifically that `cpal`/`windows-rs` no longer
-    crashes the binary. If it still crashes under MSVC too, that disproves the toolchain theory —
-    don't assume MSVC is a guaranteed fix without checking.
-  - Also unverified: `.cargo/config.toml`'s GNU-target rustflags are scoped under
-    `[target.x86_64-pc-windows-gnu]` so they shouldn't affect an MSVC build, but that assumption
-    hasn't actually been checked yet either.
+- **Sound integration — DONE, FIXED (Sonnet):** the MSVC-toolchain theory from checkpoint 8 was
+  correct. `rustup override set stable-x86_64-pc-windows-msvc` (repo-local — doesn't touch the
+  global rustup default, so other GNU-dependent work elsewhere on this machine is unaffected) plus
+  the now-installed VS Build Tools gave a clean MSVC build with **no linker workarounds needed at
+  all** (unlike the GNU toolchain's `link-self-contained` + hand-resolved `-lc++` path). Verified
+  in order, not skipped: (1) existing non-audio code builds/tests/runs clean under MSVC alone —
+  57/57 tests, no-crash runtime soak; (2) `game/src/audio.rs` + `rodio` dependency re-added
+  (identical to the reverted attempt — nothing conceptually changed, just the toolchain); (3) full
+  rebuild clean, 57/57 tests pass, **`cargo test -p game` no longer crashes either** (it did before,
+  same `STATUS_ACCESS_VIOLATION` root cause); (4) 6s runtime soak, no crash, no validation errors.
+  Confirms the original diagnosis: `windows-rs` (pulled in via `rodio`→`cpal`) targets MSVC ABI and
+  was never going to work reliably on GNU/LLVM-MinGW. Game launched for the user to actually
+  see/hear — audible confirmation that the synthesized mine/place tones actually play is still
+  from the user directly, not something I can verify myself.
+  - Also did a full manual audit of `render-vk`'s Vulkan resource lifecycle while here (every
+    `create_*`/`allocator.create_*` call cross-checked against a matching destroy, and the
+    `Drop` teardown order re-verified: allocator-owned resources destroyed before
+    `ManuallyDrop::drop(&mut self.allocator)`, which itself runs before `destroy_device`). Found
+    **no leaks or use-after-free risks** — every resource is paired, and partial-construction
+    failure paths are safe (Vulkan/vk-mem both explicitly tolerate destroying null handles, and
+    `std::mem::zeroed()`-initialized `vk_mem::Allocation`s are additionally guarded by explicit
+    null checks before use). No `TODO`/`FIXME` left in the codebase either. Not exhaustive (didn't
+    re-derive every physics/raycast edge case from scratch — those already have dedicated test
+    coverage from when they were built), but the highest-leak-risk area (manual GPU resource
+    management) is now independently checked, not just "written carefully and hoped."
+  - Both the GNU and MSVC toolchains remain installed; only this repo is pinned to MSVC via the
+    local override (`rustup override list` shows it, doesn't affect other projects).
+  - `.cargo/config.toml`'s GNU-target rustflags (scoped under `[target.x86_64-pc-windows-gnu]`)
+    are moot for this repo now that it's pinned to MSVC — confirmed by the clean MSVC build not
+    needing or triggering them at all, not just by reading the `[target]` scoping.
 
 - **Repo state:** pushed to GitHub — https://github.com/markisverycool6969699696/voxel-engine
-  (public, AGPLv3). `origin/master` and the local working tree match exactly — everything through
-  checkpoint 10 (texture atlas) is committed, pushed, and freshly re-verified working (clean
-  build, 57/57 tests, no-crash runtime soak). No uncommitted or in-flight changes.
+  (public, AGPLv3). Sound-integration commit (audio.rs + rodio dependency + MSVC toolchain
+  override) is written up here but **not yet committed** — do that next, along with a note that
+  the repo now targets MSVC by default (via `rust-toolchain` override file, not just local rustup
+  state, so a fresh clone builds correctly too — check `rustup override set` actually persisted
+  something committable, or add an explicit `rust-toolchain.toml` if not).
 
 ## Environment Notes
-- No MSVC Build Tools on this machine → using `stable-x86_64-pc-windows-gnu` toolchain.
-  **(In progress, see above: this may change if the MSVC toolchain switch for sound succeeds.)**
+- **This repo now targets the MSVC toolchain** (`rustup override set stable-x86_64-pc-windows-msvc`,
+  local to this directory), not GNU — VS Build Tools got installed specifically to fix sound (see
+  above). The GNU-toolchain notes below are historical/no longer active for this repo, kept for
+  context in case the override ever needs reverting.
 - System mingw (LLVM-MinGW) lacks GCC runtime libs → `.cargo/config.toml` sets
   `link-self-contained=yes` to pull them from rustup's `rust-mingw` component instead.
 - No Vulkan SDK installed → shaders are WGSL, compiled in-process via `naga`, not glslc.

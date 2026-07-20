@@ -10,3 +10,4 @@ render-vk = { path = "../render-vk" }
 anyhow = { workspace = true }
 glam = { workspace = true }
 winit = { workspace = true }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }

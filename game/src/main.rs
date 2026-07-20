@@ -26,6 +26,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+mod audio;
+use audio::Audio;
+
 const SPRINT_MULTIPLIER: f32 = 1.6;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = 1.5; // just under vertical, avoids the look-direction singularity
@@ -92,6 +95,8 @@ struct App {
     input: Input,
     last_frame: Option<Instant>,
     selected_block: BlockId,
+    /// `None` if no audio output device is available — sound is a nice-to-have.
+    audio: Option<Audio>,
 }
 
 impl Default for App {
@@ -116,6 +121,7 @@ impl Default for App {
             input: Input::default(),
             last_frame: None,
             selected_block: HOTBAR[0],
+            audio: Audio::new(),
         }
     }
 }
@@ -205,6 +211,9 @@ impl App {
             ) {
                 self.section.set(x, y, z, AIR);
                 edited = true;
+                if let Some(audio) = &self.audio {
+                    audio.play_mine();
+                }
             }
         } else if self.input.place_requested {
             let target = hit.block + hit.normal;
@@ -216,6 +225,9 @@ impl App {
                 if !already_solid && !overlaps_player {
                     self.section.set(x, y, z, self.selected_block);
                     edited = true;
+                    if let Some(audio) = &self.audio {
+                        audio.play_place();
+                    }
                 }
             }
         }
