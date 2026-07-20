@@ -18,13 +18,14 @@ mouse-controlled camera, and mine/place blocks in.
 - Palette-compressed chunk storage and greedy meshing
 - Physics: gravity, AABB collision, jumping
 - Mining and placing blocks via voxel raycasting, with a basic hotbar
+- Synthesized sound effects for mining/placing (placeholder tones, not real samples — see
+  [Known Issues](#known-issues))
 - Data-driven block/item definitions (JSON) — built and tested, not yet wired into the playable game
 - Background chunk streaming (multi-worker, load/unload by radius) — built and tested, not yet
   wired into the playable game
 
 **Not yet built:**
 - World generation (terrain, biomes) — a real generator is the next major milestone
-- Sound (blocked — see [Known Issues](#known-issues))
 - Textures/inventory/creative mode/multiplayer — see `docs/STARTER.md` §8 for open decisions
 
 See [MEMORY.md](MEMORY.md) for the full development log, and [project.md](project.md) for planning
@@ -56,12 +57,13 @@ Run tests with `cargo test --workspace`.
 
 ### Windows toolchain note
 
-This project currently builds with the `stable-x86_64-pc-windows-gnu` Rust toolchain rather than
-MSVC, because MSVC Build Tools weren't available on the primary dev machine when the project
-started. `.cargo/config.toml` has GNU-specific linker workarounds as a result — see
-[MEMORY.md](MEMORY.md)'s Environment Notes for details if you hit link errors. If you have MSVC
-Build Tools installed, the `stable-x86_64-pc-windows-msvc` toolchain should also work (untested as
-of this writing).
+This project builds with the MSVC Rust toolchain (`stable-x86_64-pc-windows-msvc`, pinned via
+[rust-toolchain.toml](rust-toolchain.toml)) — you'll need
+[MSVC Build Tools](https://visualstudio.microsoft.com/visual-studio/) (the "Desktop development
+with C++" workload) installed. The project briefly used the GNU/LLVM-MinGW toolchain instead
+before MSVC was available on the primary dev machine; that path required manual linker
+workarounds and, worse, caused the audio backend to crash on startup (a `windows-rs`/GNU-target
+ABI issue) — see [MEMORY.md](MEMORY.md) for the history if you're curious.
 
 ## Tech stack
 
@@ -85,10 +87,8 @@ game/          binary crate tying engine-core + render-vk together
 
 ## Known issues
 
-- **Sound is unimplemented.** An attempt using `rodio` crashed the binary on startup under the
-  GNU/LLVM-MinGW toolchain (likely a `windows-rs`/GNU-target ABI incompatibility in `cpal`, its
-  audio backend). Full details and a planned fix (switch to the MSVC toolchain) are in
-  [MEMORY.md](MEMORY.md).
+- Sound is synthesized placeholder tones (no real sound assets — see the open decision in
+  `docs/STARTER.md` §8), not a bug, just not "real" content yet.
 - Back-face culling is enabled but hasn't been independently re-confirmed by eye since being
   turned on (it *should* be a no-op visually if correct).
 
