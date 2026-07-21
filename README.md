@@ -18,16 +18,18 @@ until a real generator exists.
 - Vulkan 1.3 renderer (dynamic rendering, depth testing, back-face culling) with a placeholder
   procedurally-generated texture atlas
 - Palette-compressed chunk storage and greedy meshing
-- Physics: gravity, AABB collision, jumping
-- Mining and placing blocks via voxel raycasting, with a basic hotbar
+- Physics: gravity, AABB collision, jumping, and creative-mode flight (`F` to toggle)
+- Mining and placing blocks via voxel raycasting, with a hotbar backed by the data-driven
+  block/item registry (JSON)
 - Synthesized sound effects for mining/placing (placeholder tones, not real samples — see
   [Known Issues](#known-issues))
 - Background chunk streaming (multi-worker, load/unload by radius), wired into the playable game
-- Data-driven block/item definitions (JSON) — built and tested, not yet wired into the playable game
+- A couple of wandering placeholder mobs (gravity + collision + a random-walk heading), rendered
+  as solid-color boxes — proves the movement/collision/rendering path, not a real mob roster
 
 **Not yet built:**
 - World generation (terrain, biomes) — a real generator is the next major milestone
-- Textures/inventory/creative mode/multiplayer — see `docs/STARTER.md` §8 for open decisions
+- Textures/inventory/multiplayer — see `docs/STARTER.md` §8 for open decisions
 
 See [MEMORY.md](MEMORY.md) for the full development log, and [project.md](project.md) for planning
 notes.
@@ -38,11 +40,13 @@ notes.
 |---|---|
 | `W` `A` `S` `D` | Move |
 | Mouse | Look |
-| `Space` | Jump |
+| `Space` | Jump (ascend, while flying) |
 | `Shift` | Sprint |
+| `F` | Toggle creative-mode flight |
+| `Ctrl` | Descend (while flying) |
 | Left click | Mine (break) the targeted block |
 | Right click | Place the selected block |
-| `1`–`4` | Select hotbar block |
+| `1`–`4` | Select hotbar item |
 | `Esc` | Quit |
 
 ## Building
