@@ -47,10 +47,10 @@ const WORLD_SEED: u64 = 0x5EED_1234;
 /// the full terrain height band (world y 0..127) so a column loads as solid
 /// ground, not a floating surface slice.
 const STREAMING: StreamingConfig = StreamingConfig {
-    load_radius: 4,
+    load_radius: 7,
     unload_margin: 2,
     initial_sections: 0..=7,
-    workers: 3,
+    workers: 4,
 };
 
 /// Hotbar (number keys 1-4): item ids resolved through the data-driven
@@ -93,11 +93,14 @@ struct MobEntity {
     path: Vec<IVec3>,
     path_idx: usize,
     repath_timer: f32,
+    /// Per-instance walk speed — a little size/speed variety across mobs
+    /// without needing a real species roster.
+    walk_speed: f32,
 }
 
 impl MobEntity {
-    fn new(mob: Mob) -> Self {
-        Self { mob, path: Vec::new(), path_idx: 0, repath_timer: 0.0 }
+    fn new(mob: Mob, walk_speed: f32) -> Self {
+        Self { mob, path: Vec::new(), path_idx: 0, repath_timer: 0.0, walk_speed }
     }
 }
 
@@ -228,17 +231,32 @@ impl Default for App {
             .expect("data/items.json must parse");
         let selected_block = block_for_item(&items, &blocks, HOTBAR_ITEM_IDS[0]);
 
-        // Two mobs placed on the generated surface near spawn — not a
-        // spawning system, just enough to see wander AI working.
-        let mob = |wx: i32, wz: i32, seed: u64| {
+        // A handful of mobs scattered near spawn, each with a little
+        // size/speed variety — still not a real spawning system or species
+        // roster, just enough that "a few wandering/seeking placeholder
+        // mobs" doesn't look like two identical clones.
+        let mob = |wx: i32, wz: i32, seed: u64, size_scale: f32, speed: f32| {
             let h = generator.surface_height(wx, wz);
-            MobEntity::new(Mob::new(
-                Vec3::new(wx as f32 + 0.5, h as f32 + MOB_SIZE.y / 2.0 + 0.5, wz as f32 + 0.5),
-                MOB_SIZE / 2.0,
-                seed,
-            ))
+            let half = (MOB_SIZE * size_scale) / 2.0;
+            MobEntity::new(
+                Mob::new(
+                    Vec3::new(wx as f32 + 0.5, h as f32 + half.y + 0.5, wz as f32 + 0.5),
+                    half,
+                    seed,
+                ),
+                speed,
+            )
         };
-        let mobs = vec![mob(12, 8, 1001), mob(5, 12, 2002)];
+        let mobs = vec![
+            mob(12, 8, 1001, 1.0, MOB_WALK_SPEED),
+            mob(5, 12, 2002, 0.85, MOB_WALK_SPEED * 1.3),
+            mob(-10, 6, 3003, 1.2, MOB_WALK_SPEED * 0.8),
+            mob(9, -8, 4004, 0.9, MOB_WALK_SPEED * 1.15),
+            mob(-6, -12, 5005, 1.0, MOB_WALK_SPEED),
+            mob(18, -4, 6006, 0.75, MOB_WALK_SPEED * 1.4),
+            mob(-15, 15, 7007, 1.1, MOB_WALK_SPEED * 0.9),
+            mob(2, 20, 8008, 0.95, MOB_WALK_SPEED * 1.1),
+        ];
 
         Self {
             window: None,
@@ -328,7 +346,8 @@ impl App {
         let mut vertices = self.world_vertices.clone();
         let mut indices = self.world_indices.clone();
         for entity in &self.mobs {
-            let (mob_vertices, mob_indices) = mob_box_mesh(entity.mob.position, MOB_SIZE, MOB_BLOCK);
+            let (mob_vertices, mob_indices) =
+                mob_box_mesh(entity.mob.position, entity.mob.half * 2.0, MOB_BLOCK);
             let base = vertices.len() as u32;
             indices.extend(mob_indices.into_iter().map(|i| i + base));
             vertices.extend(mob_vertices);
@@ -364,7 +383,7 @@ impl App {
 
             if in_range && entity.repath_timer <= 0.0 {
                 entity.repath_timer = MOB_REPATH_INTERVAL;
-                let start = feet_block(entity.mob.position, MOB_SIZE.y / 2.0);
+                let start = feet_block(entity.mob.position, entity.mob.half.y);
                 entity.path = find_path(
                     start,
                     player_feet,
@@ -389,7 +408,7 @@ impl App {
                     entity.mob.steer_toward(delta.x, delta.z);
                 }
             }
-            entity.mob.update(dt, MOB_WALK_SPEED, |x, y, z| is_solid_in(chunks, x, y, z));
+            entity.mob.update(dt, entity.walk_speed, |x, y, z| is_solid_in(chunks, x, y, z));
         }
     }
 

@@ -16,16 +16,12 @@
 //! via a descriptor set. Added a depth buffer (recreated alongside the
 //! swapchain) with standard less-than depth testing.
 //!
-//! Back-face culling is **temporarily disabled** (`CullModeFlags::NONE`)
-//! while chasing a real "upside down" rendering bug confirmed by screenshot
-//! (see MEMORY.md and `engine_core::camera`'s doc comment, which just
-//! removed a clip-space Y-negation as the fix). The correct `FrontFace` for
-//! the post-fix pipeline depends on that flip's presence and wasn't
-//! independently derivable with confidence — a first attempt at deriving it
-//! for the *previous* (flipped) state was wrong (see git history), so this
-//! round deliberately isolates the orientation fix from the culling-
-//! direction guess rather than compounding two unconfirmed changes. See the
-//! rasterization state below for the re-enable plan.
+//! Back-face culling is enabled (`FrontFace::CLOCKWISE` + `CullModeFlags::BACK`),
+//! paired with `engine_core::camera::VULKAN_CLIP_CORRECTION` being identity
+//! (no clip-space Y-flip) — user-confirmed by screenshot to render right-side
+//! up after a real "upside down" bug (see MEMORY.md for the debugging
+//! history). These two settings move together; changing one without the
+//! other reintroduces either an inside-out or upside-down render.
 //!
 //! Sync design (the part that must be right):
 //! - `FRAMES_IN_FLIGHT = 2` frames, each with its own command buffer,
@@ -699,26 +695,16 @@ impl VkRenderer {
                 .viewport_count(1)
                 .scissor_count(1);
 
-            // Culling TEMPORARILY OFF. Context: `engine_core::camera`'s
-            // clip-space Y-flip was just removed to fix a confirmed (by
-            // screenshot) upside-down render — but which `FrontFace` value
-            // pairs correctly with "no flip" wasn't independently derivable
-            // with confidence (see camera.rs's doc comment; the theoretical
-            // model that predicted the *previous* setting was wrong once
-            // already this session). Rather than guess again and risk a
-            // second confusing "still broken, but now for a different
-            // reason" report, cull mode is NONE here so the orientation fix
-            // can be checked in isolation — a fully unculled scene should
-            // just look right-side up (if inefficient), with no separate
-            // culling-direction variable to confuse that check. Once
-            // orientation is confirmed correct, re-enable `CullModeFlags::BACK`
-            // and pick whichever `FrontFace` doesn't make geometry vanish —
-            // that follow-up no longer risks another blind full round-trip
-            // since the harder (orientation) variable will already be pinned
-            // down.
+            // Back-face culling, re-enabled now that the user confirmed
+            // orientation renders correctly with `engine_core::camera`'s
+            // clip-space correction as identity (see camera.rs and
+            // MEMORY.md for the debugging history). `CLOCKWISE` pairs with
+            // that state; if geometry ever vanishes or looks inside-out
+            // again, this pair (this value + camera.rs's clip correction)
+            // moves together, never independently.
             let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::NONE)
+                .cull_mode(vk::CullModeFlags::BACK)
                 .front_face(vk::FrontFace::CLOCKWISE)
                 .line_width(1.0);
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()

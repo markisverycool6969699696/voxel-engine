@@ -32,6 +32,14 @@ pub const COAL_ORE: BlockId = BlockId(10);
 pub const IRON_ORE: BlockId = BlockId(11);
 
 pub const SEA_LEVEL: i32 = 64;
+/// Surface height above which terrain is bare rock regardless of biome —
+/// only the tallest mountain-mask peaks (see `TerrainGenerator::height`)
+/// reach this, so it reads as an actual treeline, not a random override.
+/// Calibrated empirically: across a wide scan, realistic peaks only reach
+/// ~sea level + 18-20 (the height formula's amplitude term rarely gets
+/// close to its theoretical max — fbm-summed noise clusters near its
+/// midpoint), so `+30` (the original guess) was never reachable.
+const MOUNTAIN_ROCK_HEIGHT: i32 = SEA_LEVEL + 12;
 /// Nothing (terrain or trees) reaches this high; sections whose bottom is
 /// above it are pure air and skip generation entirely.
 const SKY_FLOOR: i32 = 132;
@@ -177,7 +185,12 @@ impl TerrainGenerator {
         // height field it sits on is continuous (see `height`), so biome
         // edges blend in elevation rather than forming cliffs — this is the
         // "biome blending" the spec asks for, done on the smooth axis.
-        let (surface, sub, allow_tree) = if temp > 0.62 && humid < 0.40 {
+        // Bare rock above the treeline takes priority over the
+        // temperature/humidity biomes below — real mountain peaks are rock
+        // regardless of the regional climate.
+        let (surface, sub, allow_tree) = if height > MOUNTAIN_ROCK_HEIGHT {
+            (STONE, STONE, false) // rocky mountain peak
+        } else if temp > 0.62 && humid < 0.40 {
             (SAND, SAND, false) // desert
         } else if temp < 0.32 {
             (SNOW, DIRT, humid > 0.5) // snowy: grass-under-snow, sparse trees
@@ -393,6 +406,29 @@ mod tests {
             }
         }
         assert!(water > 0, "expected some water in low areas across the sampled region");
+    }
+
+    #[test]
+    fn mountain_peaks_are_rocky_and_treeless() {
+        // Mountain-mask peaks are a large, low-frequency feature (wavelength
+        // ~512 blocks), so a wide-enough scan should find at least one
+        // column above the treeline for a couple of different seeds.
+        let mut found = false;
+        for seed in [1u64, 2, 3, 4, 5] {
+            let g = TerrainGenerator::new(seed);
+            for wx in (-300..300).step_by(5) {
+                for wz in (-300..300).step_by(5) {
+                    let col = g.column(wx, wz);
+                    if col.height > MOUNTAIN_ROCK_HEIGHT {
+                        found = true;
+                        assert_eq!(col.surface, STONE, "peak surface must be rock");
+                        assert_eq!(col.sub, STONE);
+                        assert!(!col.allow_tree, "no trees above the treeline");
+                    }
+                }
+            }
+        }
+        assert!(found, "no seed in the sampled set produced a mountain peak");
     }
 
     #[test]
