@@ -543,6 +543,60 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     distance, expanded biomes/mobs/items, and this checkpoint's Creative/Survival + start menu +
     save/load. Texture pack remains explicitly deferred per the user's own choice.
 
+- **BUG + FIX (2026-07-21, Sonnet): real screenshots caught two actual visual defects the first
+  time the finished feature batch was actually launched and looked at.** User asked to launch the
+  game, sent a real screenshot (Win+PrtScn, same working method established earlier this project —
+  computer-use tooling here still can't see the user's physical screen).
+  - **Screenshot 1**: a huge stretched checkerboard floor/canopy and a giant diagonal beam crossing
+    the whole screen. Root cause was a pre-existing, already-documented-but-never-fixed limitation:
+    `triangulate()` always emitted a `0..1` unit-square UV per quad regardless of merged size, so a
+    large greedy-merged face (a whole flat floor slice, a big leaf-canopy face) stretched one atlas
+    tile across the entire face instead of repeating it — normally subtle, but dense forest canopy
+    produces unusually large flat merged quads, and a near-edge-on one read as a huge diagonal
+    streak. Fixed: `engine-core/src/mesh.rs`'s `triangulate()` now emits UV spanning
+    `0..width`/`0..height` in block units (read straight off the quad's own corners, no new data
+    needed); `render-vk/shaders/mesh.wgsl`'s fragment shader `fract()`s it before sampling, so the
+    tile repeats once per block on a merged quad instead of stretching. `c56fc46`.
+  - **Same commit**: menu buttons were "unclear, unreadable" — colored bars with zero text, since
+    no font atlas exists. Added a tiny procedural pixel font (`game/src/ui.rs`: `glyph()` is a 3x5
+    bitmap per letter, `text_mesh()` lays a string out as small quads — same "no image assets, draw
+    it with plain colored quads" approach used everywhere else placeholder in this project). Only
+    covers the uppercase letters CREATIVE/SURVIVAL/LOAD actually need (C,R,E,A,T,I,V,S,U,L,O,D);
+    unsupported characters are silently skipped, not an error, since this is cosmetic UI text.
+    `menu_mesh`'s signature changed from `&[[f32;4]]` colors to `&[(&str, [f32;4])]` label/color
+    pairs.
+  - **Screenshot 2** (after relaunching with the above fix): the diagonal beam and stretching were
+    gone, but the user still saw what looked like holes — solid ground with flat, sharp-edged dark
+    gray patches, "supposed to be blocks not see-through to bottom gray floor." Diagnosed instead of
+    guessed: computed the actual placeholder color water resolves to. `tile_for_block(id) = id %
+    ATLAS_TILE_COUNT`, and `2654435761 % 16 == 1`, so this is the identity for every block id below
+    16 — every block this project currently defines — confirmed arithmetically (bash, exact integer
+    math) rather than assumed. Water (id 5) → tile 5 → the *old* hash-based
+    `generate_atlas_pixels` produced RGB(197,176,101), a khaki/tan — not blue, not even gray really,
+    but apparently close enough under a screenshot/compression/lighting to read as a flat "hole"
+    against green grass, especially with zero texture detail to suggest depth or flow. Considered
+    and ruled out (with the same math) that this was a meshing/culling bug — `is_opaque` for the
+    world mesh is `|b| b != AIR`, so water *does* get faces; the arbitrary hash color was the whole
+    problem. Fixed: `render-vk/src/lib.rs`'s `generate_atlas_pixels` now uses a new
+    `tile_base_color()` — hand-picked, semantically obvious colors for every known block id (water
+    blue, grass green, dirt brown, stone gray, sand tan, snow near-white, etc.); unknown tile
+    indices (room for block ids up to 15) still fall back to the original hash, so future content
+    still gets *some* distinct color for free. `game/src/ui.rs`'s `color_for_block` (the separate
+    hash the inventory swatches used) got the same table, so a swatch now actually matches what
+    that block looks like in the world. `d65798d`.
+  - Verified both commits: `cargo test --workspace` 96/96 (was 93; +1 mesh.rs UV test rewritten for
+    the merged case, +3 ui.rs font tests; the color-table commit added no new tests — pure data
+    change, existing color tests already cover shape/range/distinctness), clean build zero warnings
+    both times, 15s soak clean, no leftover process each time. **The water-color fix specifically is
+    not yet visually re-confirmed** — the user went to bed right after reporting it, so there was no
+    chance for a third screenshot loop. Documented exactly what was checked/computed and why, same
+    discipline as the earlier upside-down saga, rather than claiming false confidence.
+  - **Practice reinforced**: both defects were entirely real and were caught immediately once an
+    actual screenshot existed to look at — soak-testing and unit tests alone did not and could not
+    have caught either (UV stretching and hash-color legibility are both "looks wrong to a human,"
+    not "crashes or fails an assertion"). Get a real screenshot before declaring a visual feature
+    batch done, not just green tests.
+
 ## Next Up
 **Both Opus-tier milestones are done** (terrain generation + biome blending, and pathfinding
 around partially-loaded chunks). The remaining Opus §6 item, "reviewing/hardening the foundation,"
@@ -555,6 +609,11 @@ inventory picker, Creative/Survival distinction, start menu (New World / Load Wo
 single-player world save/load are all implemented, tested, and pushed (see the checkpoints above).
 Texture pack remains **explicitly deferred by the user's own choice**, not forgotten — revisit only
 if they ask.
+
+**First thing to check next session**: get a fresh screenshot and confirm water actually reads as
+water now (blue, semantic colors) and the stretched-texture/diagonal-beam issue is fully gone —
+the fix for both is in and tested, but the user went to bed before a third screenshot could confirm
+it visually.
 
 What's left beyond that wishlist, none of it a foundational milestone:
 - Real textures (atlas is placeholder flat colors per block id) — needs an asset-pack decision

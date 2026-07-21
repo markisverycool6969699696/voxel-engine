@@ -110,9 +110,12 @@ game/          binary crate tying engine-core + render-vk together (+ data/ bloc
 
 ## Known issues
 
-- Textures are placeholder: each block id hashes to a flat-colored atlas tile, so grass/water/etc.
-  aren't their "expected" colors yet. Terrain *shape* is real; block *coloring* is a stand-in until
-  a real asset set is chosen (`docs/STARTER.md` §8).
+- Textures are placeholder: each block gets a flat, checkered, semantically-colored atlas tile
+  (water is blue, grass is green, stone is gray, etc. — see `render-vk::tile_base_color`), not a
+  real texture with visible detail/grain. Terrain *shape* is real; block *coloring* is a stand-in
+  until a real asset set is chosen (`docs/STARTER.md` §8). Tiles now repeat once per block on
+  merged/greedy-meshed faces instead of stretching one tile across the whole face (that stretching
+  used to be bad enough on large flat faces to look like a rendering bug — see MEMORY.md).
 - Water is a solid, walkable block, not a flowing fluid — real fluid behavior (the `fluid`
   behavior tag exists in the registry for it) is future work.
 - Sound is synthesized placeholder tones (no real sound assets — see the open decision in
