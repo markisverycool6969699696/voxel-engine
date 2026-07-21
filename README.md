@@ -15,28 +15,35 @@ regenerated on demand rather than stored. You spawn on the surface and can walk,
 mine/place blocks in it.
 
 **Working:**
-- Vulkan 1.3 renderer (dynamic rendering, depth testing, back-face culling) with a placeholder
+- Vulkan 1.3 renderer (dynamic rendering, depth testing, back-face culling), a second screen-space
+  UI pipeline (crosshair, inventory, menu — no depth test, alpha-blended), and a placeholder
   procedurally-generated texture atlas
 - Palette-compressed chunk storage and greedy meshing
 - **Seeded world generation**: layered value-noise heightmap terrain, temperature/humidity biomes
-  (with blended elevation), water below sea level, 3D-noise caves, ore, and trees — fully
-  deterministic (unmodified chunks are regenerated, never stored)
+  (with blended elevation, plus rocky treeless mountain peaks), water below sea level, 3D-noise
+  caves, ore, and trees — fully deterministic (unmodified chunks are regenerated, never stored)
 - Background chunk streaming (multi-worker, load/unload by radius) driving the generator
-- Physics: gravity, AABB collision, jumping, and creative-mode flight (`F` to toggle)
-- Mining and placing blocks via voxel raycasting, with a hotbar backed by the data-driven
-  block/item registry (JSON)
+- Physics: gravity, AABB collision, jumping, and creative-mode flight (`F` to toggle, Creative only)
+- Mining and placing blocks via voxel raycasting, with a full inventory picker (`E` to open, click
+  any registered block to select it) backed by the data-driven block/item registry (JSON)
 - Synthesized sound effects for mining/placing (placeholder tones, not real samples — see
   [Known Issues](#known-issues))
-- A couple of placeholder mobs (gravity + collision, rendered as solid-color boxes) that
+- A handful of placeholder mobs (gravity + collision, rendered as solid-color boxes) that
   **pathfind toward the player** using voxel A* — and, crucially, refuse to route through
   not-yet-loaded chunks, falling back to wandering when there's no valid path. Not a real mob
   roster, but the movement/collision/pathfinding/rendering path is all real.
+- **Main menu on launch**: New World (Creative or Survival — Survival just disables flight, no
+  health/hunger/combat yet) or Load World (continues your single saved world — single-player only,
+  not real networking). World save/load persists only the diff (player-modified sections); saves
+  automatically on window close.
 
 **Not yet built:**
-- Real textures (the atlas is still procedural placeholder colors per block id) and an inventory
-  UI — see `docs/STARTER.md` §8 for open decisions
+- Real textures (the atlas is still procedural placeholder colors per block id) — see
+  `docs/STARTER.md` §8 for the open decision
 - Fluid behavior (water is currently a solid, walkable block, not a flowing fluid), multiplayer,
   the macOS/Metal backend
+- Menu text (no font atlas exists yet, so menu/inventory options are flat-colored bars/swatches,
+  not labels)
 
 See [MEMORY.md](MEMORY.md) for the full development log, and [project.md](project.md) for planning
 notes.
@@ -45,17 +52,20 @@ notes.
 
 | Input | Action |
 |---|---|
+| Mouse (menu) | Click a colored bar to pick New World (Creative/Survival) or Load World |
 | `W` `A` `S` `D` | Move |
 | Mouse | Look |
 | `Space` | Jump (ascend, while flying) |
 | `Shift` | Sprint |
-| `F` | Toggle creative-mode flight |
+| `F` | Toggle creative-mode flight (Creative only) |
+| `G` | Toggle Creative/Survival (placeholder until mode is only picked at the menu) |
 | `Ctrl` | Descend (while flying) |
 | Left click | Mine (break) the targeted block |
 | Right click | Place the selected block |
+| `E` | Open/close the inventory — click a swatch to select that block |
 | `1`–`4` | Select hotbar item |
-| `Esc` | Free the cursor (click back in, or press `Esc` again, to resume) |
-| Alt+F4 / window close button | Quit |
+| `Esc` | Close the inventory if open, else free the cursor (click back in, or press `Esc` again, to resume) |
+| Alt+F4 / window close button | Quit (auto-saves the world first) |
 
 ## Building
 
@@ -111,6 +121,11 @@ game/          binary crate tying engine-core + render-vk together (+ data/ bloc
   (`FrontFace` was set to the wrong winding, culling the near faces instead of the far ones,
   which read as the world rendering inside-out once real terrain made orientation unambiguous).
   Fixed; see MEMORY.md for the full writeup.
+- Survival is mode-only (flight disabled) — no health, hunger, combat, or mining-yields-drops
+  resource loop yet.
+- Saved mobs aren't part of world save/load — they respawn at their fixed session-start positions
+  on Load World, only terrain/block edits persist.
+- No font rendering yet, so the main menu and inventory use flat colors instead of text labels.
 
 ## License
 

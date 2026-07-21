@@ -487,6 +487,62 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     peaks, 8 mobs, crosshair, inventory grid) — same standing caveat as always: tests + soak-run
     confirm nothing crashes/regresses structurally, but "does it look right" is the user's call.
 
+- **Checkpoint (2026-07-21, Sonnet): the rest of the user's feature wishlist landed —
+  Creative/Survival distinction, start menu, single-player save/load.** Closes out tasks #14–#16.
+  - `af94349` — `GameMode` enum (Creative/Survival) on `App`, default Creative. Survival disables
+    flight only (`F` no-ops outside Creative; switching into Survival while flying forces it off
+    via `set_game_mode`) — deliberately not full survival mechanics (no health/hunger/mining-
+    drops), matching the scope call already logged in this file's "Next Up" section before this
+    checkpoint. `G` toggles it for now as a placeholder until the menu below is the only way to
+    pick it. 87/87 tests (no new ones — pure control-flow change).
+  - `66a7862` — main menu + save/load, the biggest single addition this session:
+    - **Main menu** (`AppState::MainMenu`/`InGame` on `App`): shown on launch, pauses physics/
+      streaming/mob simulation and gates keyboard input (Escape/E are no-ops at the menu — letting
+      Escape through would've re-locked the cursor the menu needs free to be clickable) until a
+      mouse click picks an option. The world is already generated/streamed by the time the menu
+      shows (that startup work was always eager, before this checkpoint too), so "New World" is
+      just "use it as-is, ignore any save file, set the mode" rather than actually regenerating.
+      No font atlas exists (same open decision as real textures), so options are colored bars —
+      new `ui::menu_mesh`/`menu_hit_test` (+`menu_option_rect` as the shared single source of
+      truth, same pattern as the inventory grid's `inventory_cell_rect`). "Load World" only
+      appears once a save file exists.
+    - **Save/load** (new `game/src/save.rs`): single fixed slot (`world_save.json`, gitignored).
+      Diff-only — only player-modified sections persist, matching `streaming.rs`'s existing
+      discard-unmodified-on-evict philosophy (unmodified terrain regenerates identically from
+      `WORLD_SEED`, so saving it too would be pure waste). `WorldSave` serializes the real
+      `engine_core::chunk::ChunkColumn` (now `Serialize`/`Deserialize`/`Clone`, alongside
+      `PalettedSection`/`BlockId`) directly — no separate save-format DTO, the palette-compressed
+      representation round-trips through JSON as-is.
+    - **engine-core additions**: `ChunkManager::load_saved` (overwrites already-loaded columns'
+      sections in place; stashes the rest in a new `pending_overlay: HashMap<(i32,i32,i32),
+      PalettedSection>` field that `pump()` now consults before using a freshly-generated section,
+      so a saved edit correctly overrides generation no matter when that column happens to stream
+      in) and `ChunkManager::modified_columns` (snapshot of currently-loaded modified columns
+      without evicting them — combined with the pre-existing `drain_evicted_modified` at save
+      time to capture the *complete* modified set for the session, not just what happened to be
+      evicted). 5 new streaming tests.
+    - **Loading re-centers streaming**: a saved player position can be far from wherever
+      `resumed()`'s startup blocking-load centered on, so `load_saved_world` re-runs the same
+      bounded (`10s` deadline) blocking-pump pattern `resumed()` already established, keyed to the
+      *restored* position, before dropping the player in — avoids spawning over an unloaded void.
+    - **Caught a real bug via TDD**: the first draft of `save.rs`'s JSON round-trip test used a
+      world-space y coordinate where a local (in-section) one was needed, so the assertion failed
+      against a section inserted at `section_y=0` — the save/load *code* was correct, the test's
+      own coordinate math was wrong. Fixed by picking `section_y=0` so world-y and local-y
+      coincide, keeping the test simple rather than getting the div_euclid/rem_euclid math right
+      by hand. Documented as a reminder that a new test failing doesn't always mean the code under
+      test is wrong — worth checking which one has the bug before "fixing" either.
+  - Verified (both commits): `cargo test --workspace` 93/93 (was 87; +5 streaming, +2 ui.rs menu
+    hit-test, +1 save.rs round-trip), clean build zero warnings both times, 15s soak clean each
+    time, no leftover process. **Not yet visually confirmed by the user** — same standing caveat:
+    tests + soak-run confirm nothing crashes/regresses structurally, "does the menu look/feel
+    right" is the user's call, especially since it's colored bars rather than text (no font
+    rendering exists) which may read as confusing without knowing this document's explanation.
+  - **All 6 items from the user's original feature wishlist are now done**: performance (mesh
+    caching/throttling from the bug-fix checkpoints above), inventory, crosshair, wider render
+    distance, expanded biomes/mobs/items, and this checkpoint's Creative/Survival + start menu +
+    save/load. Texture pack remains explicitly deferred per the user's own choice.
+
 ## Next Up
 **Both Opus-tier milestones are done** (terrain generation + biome blending, and pathfinding
 around partially-loaded chunks). The remaining Opus §6 item, "reviewing/hardening the foundation,"
@@ -494,18 +550,11 @@ got an implicit pass this session: the real terrain generator + streaming at loa
 the streaming/eviction path far harder than the old void generator ever did, and it soaked clean —
 but a dedicated fresh-eyes audit is still worthwhile if the user wants belt-and-suspenders.
 
-**In progress (per user's large feature wishlist, Sonnet-tier, this session):** crosshair +
-inventory picker are done (above). Remaining from that ask, in order:
-- Creative/Survival mode distinction — planned as: Survival disables flight (the one meaningful
-  existing creative-only mechanic); explicitly NOT full survival mechanics (no health/hunger/
-  combat) unless the user asks for that separately.
-- Start menu (New World / Load World, Creative/Survival picker) — a pre-gameplay `AppState::
-  MainMenu` screen using the new UI pipeline.
-- Single-player world save/load — serialize seed + modified chunks to a file; `ChunkManager::
-  drain_evicted_modified()` already exists for exactly this. **User explicitly confirmed** (via
-  AskUserQuestion) that "Join Yours" means loading a saved single-player world, NOT real
-  networked multiplayer — scope this accordingly, don't build networking.
-- Texture pack — **user explicitly said hold off**, focus on gameplay features first.
+**DONE — the user's entire large feature wishlist from this session is now complete**: crosshair,
+inventory picker, Creative/Survival distinction, start menu (New World / Load World), and
+single-player world save/load are all implemented, tested, and pushed (see the checkpoints above).
+Texture pack remains **explicitly deferred by the user's own choice**, not forgotten — revisit only
+if they ask.
 
 What's left beyond that wishlist, none of it a foundational milestone:
 - Real textures (atlas is placeholder flat colors per block id) — needs an asset-pack decision
