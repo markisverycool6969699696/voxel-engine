@@ -54,6 +54,17 @@ const STREAMING: StreamingConfig = StreamingConfig {
     workers: 4,
 };
 
+/// Creative has flight and unrestricted block access (the inventory grid
+/// already shows every registered block regardless of mode); Survival
+/// disables flight. Deliberately not full survival mechanics (no health,
+/// hunger, or mining-yields-drops resource loop) — that's a separate, much
+/// larger feature the user hasn't asked for yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GameMode {
+    Creative,
+    Survival,
+}
+
 /// Hotbar (number keys 1-4): item ids resolved through the data-driven
 /// `Registry<ItemDef>`/`Registry<BlockDef>` (see `data/items.json`,
 /// `data/blocks.json`) instead of a raw block-id array. Still the same 4
@@ -229,6 +240,10 @@ struct App {
     /// `E` toggles this — opens the block picker (frees the cursor to click
     /// a swatch, closes and re-locks on selection or `Esc`).
     inventory_open: bool,
+    /// `G` toggles this for now (placeholder until the start menu — task 15
+    /// — lets the player choose it up front instead). Survival forces
+    /// flight off; Creative allows `F` to toggle it as before.
+    game_mode: GameMode,
 }
 
 impl Default for App {
@@ -302,6 +317,7 @@ impl Default for App {
             mesh_upload_accum: 0.0,
             cursor_locked: true,
             inventory_open: false,
+            game_mode: GameMode::Creative,
         }
     }
 }
@@ -415,6 +431,16 @@ impl App {
     fn set_inventory_open(&mut self, open: bool) {
         self.inventory_open = open;
         self.set_cursor_lock(!open); // set_cursor_lock already calls rebuild_ui
+    }
+
+    /// Survival forces flight off (falling out of the sky mid-toggle would
+    /// be a jarring way to find out flight got disabled); Creative leaves
+    /// whatever flight state the player already had alone.
+    fn set_game_mode(&mut self, mode: GameMode) {
+        self.game_mode = mode;
+        if mode == GameMode::Survival && self.player.flying {
+            self.player.toggle_flying();
+        }
     }
 
     /// Hit-tests the last known cursor position against the inventory grid;
@@ -764,8 +790,14 @@ impl ApplicationHandler for App {
                         self.selected_block =
                             block_for_item(&self.items, &self.blocks, HOTBAR_ITEM_IDS[slot]);
                     }
-                    if code == KeyCode::KeyF {
+                    if code == KeyCode::KeyF && self.game_mode == GameMode::Creative {
                         self.player.toggle_flying();
+                    }
+                    if code == KeyCode::KeyG {
+                        self.set_game_mode(match self.game_mode {
+                            GameMode::Creative => GameMode::Survival,
+                            GameMode::Survival => GameMode::Creative,
+                        });
                     }
                 }
                 match event.state {
