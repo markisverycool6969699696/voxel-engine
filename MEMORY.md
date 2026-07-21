@@ -448,20 +448,72 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     screenshot, not a confirmed fix** — said so explicitly rather than repeating the overclaiming
     mistake from the culling-direction attempt.
 
+- **Orientation bug CONFIRMED FIXED by user (2026-07-21); culling re-enabled + feature batch
+  (Sonnet).** User's "GOOD FINAly now improve..." message confirmed the identity-clip-correction
+  fix actually resolved "upside down" — closing out the multi-attempt debugging saga documented
+  above. Follow-up landed in 3 commits:
+  - `c9da58b` — re-enabled `CullModeFlags::BACK` + `FrontFace::CLOCKWISE` (safe now that
+    orientation is confirmed correct, paired with the identity clip correction); widened
+    `STREAMING.load_radius` 4→7 (workers 3→4, affordable now that per-section mesh caching means
+    an edit/stream-in only re-meshes the changed sections, not the whole world) — this is the
+    interpretation used for the user's ambiguous "make chunks a bit deep not 1 block" ask (vertical
+    depth was already 0..=7, i.e., not "1 block," so read as "render/stream farther," not deeper);
+    added a rocky/treeless mountain-peak override to `worldgen.rs` (bare rock above a calibrated
+    treeline height regardless of biome climate; threshold recalibrated from a wrong first guess —
+    see the "Errors and fixes" pattern already established in this log — via a throwaway scan of
+    actual achievable heights, 1 new test); mob count 2→8 with per-instance size/speed variety;
+    `items.json` grew 4→9 entries (one per placeable block). 82/82 tests, 20s soak clean.
+  - `b672e0b` — new second Vulkan pipeline in `render-vk` purely for 2D screen-space UI: no depth
+    test, no culling, alpha-blended, empty descriptor/pipeline layout, NDC-direct vertices
+    (`UiVertex`, new `mesh.rs` type), shares the existing dynamic-rendering pass with the world
+    pipeline (bind+draw after the world mesh draw, same command buffer). New `render-vk/shaders/
+    ui.wgsl` (passthrough vertex shader, flat-color fragment shader). `Renderer` trait gained
+    `set_ui_mesh` alongside `set_mesh`, same wholesale-replace/call-sparingly contract. Verified
+    clean build, zero warnings, on first attempt.
+  - `8c8ed71` — new `game/src/ui.rs`: pure-geometry builders (crosshair, inventory grid) plus the
+    grid layout/hit-test math, with `inventory_cell_rect` as the single source of truth shared
+    between what's drawn and what a click hits (so they can never disagree about where a cell is).
+    5 unit tests, no GPU needed. Wired into `App`: crosshair shows whenever the cursor is locked;
+    `E` toggles a full-screen inventory grid of every registered placeable block (colored swatch
+    per block, highlight outline on the current selection) and frees the cursor; clicking a swatch
+    sets `selected_block` and closes it; `Escape` closes the inventory first if open, otherwise
+    behaves as before (free/lock cursor) — reused the existing `cursor_locked` gate so WASD/
+    mouse-look/mine-place were already correctly suppressed while the inventory is open, no new
+    gating logic needed. Added `WindowEvent::CursorMoved` tracking (`Input.cursor_pos`) since click
+    hit-testing needs absolute cursor position, which the game hadn't tracked before (only the
+    mouse-look delta). 87/87 tests (was 82), clean build zero warnings, 15s soak clean, no leftover
+    process.
+  - **Not yet independently re-confirmed by the user visually** (widened render distance, mountain
+    peaks, 8 mobs, crosshair, inventory grid) — same standing caveat as always: tests + soak-run
+    confirm nothing crashes/regresses structurally, but "does it look right" is the user's call.
+
 ## Next Up
 **Both Opus-tier milestones are done** (terrain generation + biome blending, and pathfinding
 around partially-loaded chunks). The remaining Opus §6 item, "reviewing/hardening the foundation,"
-got an implicit pass this session: the real terrain generator + streaming at load_radius 4 exercises
+got an implicit pass this session: the real terrain generator + streaming at load_radius 7 exercises
 the streaming/eviction path far harder than the old void generator ever did, and it soaked clean —
 but a dedicated fresh-eyes audit is still worthwhile if the user wants belt-and-suspenders.
 
-What's left is content/polish/port work, none of it a foundational milestone:
+**In progress (per user's large feature wishlist, Sonnet-tier, this session):** crosshair +
+inventory picker are done (above). Remaining from that ask, in order:
+- Creative/Survival mode distinction — planned as: Survival disables flight (the one meaningful
+  existing creative-only mechanic); explicitly NOT full survival mechanics (no health/hunger/
+  combat) unless the user asks for that separately.
+- Start menu (New World / Load World, Creative/Survival picker) — a pre-gameplay `AppState::
+  MainMenu` screen using the new UI pipeline.
+- Single-player world save/load — serialize seed + modified chunks to a file; `ChunkManager::
+  drain_evicted_modified()` already exists for exactly this. **User explicitly confirmed** (via
+  AskUserQuestion) that "Join Yours" means loading a saved single-player world, NOT real
+  networked multiplayer — scope this accordingly, don't build networking.
+- Texture pack — **user explicitly said hold off**, focus on gameplay features first.
+
+What's left beyond that wishlist, none of it a foundational milestone:
 - Real textures (atlas is placeholder flat colors per block id) — needs an asset-pack decision
-  (STARTER.md §8), Sonnet-tier once decided.
+  (STARTER.md §8), Sonnet-tier once decided; user has already said hold off on this specifically.
 - Fluid behavior for water (currently a solid walkable block; `BehaviorTag::Fluid` already exists
   in the registry as the hook) — Sonnet-tier.
-- Per-chunk GPU mesh buffers (perf), inventory UI, save/load of modified chunks
-  (`drain_evicted_modified` is already wired for it), Metal/macOS backend, multiplayer.
+- Per-chunk GPU mesh buffers (perf), Metal/macOS backend, real multiplayer (explicitly out of
+  scope per the user's clarification above, unless they ask again later).
 - Terrain/nav tuning: noise constants (`worldgen.rs`) and nav params (`NavConfig`, seek range/
   repath interval in `main.rs`) are first coherent passes, easy knobs if the user wants a
   different feel.
