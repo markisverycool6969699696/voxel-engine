@@ -15,13 +15,14 @@ use engine_core::camera::Camera;
 use engine_core::chunk::{BlockId, PalettedSection, AIR};
 use engine_core::mesh::{greedy_mesh, triangulate, MeshVertex};
 use engine_core::mob::Mob;
+use engine_core::pathfind::{find_path, Cell, NavConfig};
 use engine_core::physics::PlayerController;
 use engine_core::raycast::raycast_voxels;
 use engine_core::registry::{BlockDef, ItemDef, Registry};
 use engine_core::streaming::{ChunkManager, StreamingConfig};
 use engine_core::worldgen::TerrainGenerator;
 use engine_core::Renderer;
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 use render_vk::VkRenderer;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -76,6 +77,51 @@ fn block_for_item(items: &Registry<ItemDef>, blocks: &Registry<BlockDef>, item_i
 const MOB_BLOCK: BlockId = BlockId(12);
 const MOB_SIZE: Vec3 = Vec3::new(0.6, 0.8, 0.6);
 const MOB_WALK_SPEED: f32 = 1.5;
+/// Mobs beyond this horizontal distance from the player don't bother
+/// pathfinding (they just wander) — bounds cost and keeps far mobs idle.
+const MOB_SEEK_RANGE: f32 = 40.0;
+/// Seconds between path recomputes per mob — pathfinding every frame is
+/// wasteful and jittery; a stale path is followed in between.
+const MOB_REPATH_INTERVAL: f32 = 0.5;
+
+/// A mob plus its current navigation state. The mob seeks the player via
+/// `pathfind`, which refuses to route through unloaded chunks; when no path
+/// exists (player unreachable, flying, or across ungenerated terrain) the mob
+/// falls back to its built-in wander.
+struct MobEntity {
+    mob: Mob,
+    path: Vec<IVec3>,
+    path_idx: usize,
+    repath_timer: f32,
+}
+
+impl MobEntity {
+    fn new(mob: Mob) -> Self {
+        Self { mob, path: Vec::new(), path_idx: 0, repath_timer: 0.0 }
+    }
+}
+
+/// World block at `(x,y,z)` classified for navigation: `Unknown` where the
+/// chunk isn't loaded (so the pathfinder never routes through it), else
+/// `Solid`/`Open` by whether the block is air.
+fn nav_cell(chunks: &ChunkManager, x: i32, y: i32, z: i32) -> Cell {
+    let (cx, cz) = (x.div_euclid(SECTION_DIM), z.div_euclid(SECTION_DIM));
+    let (lx, lz) = (x.rem_euclid(SECTION_DIM) as usize, z.rem_euclid(SECTION_DIM) as usize);
+    match chunks.block(cx, cz, lx, y, lz) {
+        None => Cell::Unknown,
+        Some(b) if b == AIR => Cell::Open,
+        Some(_) => Cell::Solid,
+    }
+}
+
+/// The block a grounded entity's feet stand in (floor of its AABB base).
+fn feet_block(center: Vec3, half_height: f32) -> IVec3 {
+    IVec3::new(
+        center.x.floor() as i32,
+        (center.y - half_height + 0.001).floor() as i32,
+        center.z.floor() as i32,
+    )
+}
 
 /// Builds a small axis-aligned box mesh for a mob by reusing `greedy_mesh`'s
 /// already-tested winding/tiling logic on a synthetic single-cell section,
@@ -126,7 +172,7 @@ struct App {
     player: PlayerController,
     chunks: ChunkManager,
     streaming_center: Option<(i32, i32)>,
-    mobs: Vec<Mob>,
+    mobs: Vec<MobEntity>,
     blocks: Registry<BlockDef>,
     items: Registry<ItemDef>,
     input: Input,
@@ -162,11 +208,11 @@ impl Default for App {
         // spawning system, just enough to see wander AI working.
         let mob = |wx: i32, wz: i32, seed: u64| {
             let h = generator.surface_height(wx, wz);
-            Mob::new(
+            MobEntity::new(Mob::new(
                 Vec3::new(wx as f32 + 0.5, h as f32 + MOB_SIZE.y / 2.0 + 0.5, wz as f32 + 0.5),
                 MOB_SIZE / 2.0,
                 seed,
-            )
+            ))
         };
         let mobs = vec![mob(12, 8, 1001), mob(5, 12, 2002)];
 
@@ -222,8 +268,8 @@ impl App {
                 vertices.extend(section_vertices);
             }
         }
-        for mob in &self.mobs {
-            let (mob_vertices, mob_indices) = mob_box_mesh(mob.position, MOB_SIZE, MOB_BLOCK);
+        for entity in &self.mobs {
+            let (mob_vertices, mob_indices) = mob_box_mesh(entity.mob.position, MOB_SIZE, MOB_BLOCK);
             let base = vertices.len() as u32;
             indices.extend(mob_indices.into_iter().map(|i| i + base));
             vertices.extend(mob_vertices);
@@ -244,10 +290,46 @@ impl App {
         self.chunks.pump();
     }
 
+    /// Advances each mob: pathfind toward the player (recomputed on a timer,
+    /// skipping unloaded chunks), steer along the current path node, then step
+    /// physics. Mobs with no viable path fall back to wandering.
     fn update_mobs(&mut self, dt: f32) {
         let chunks = &self.chunks;
-        for mob in &mut self.mobs {
-            mob.update(dt, MOB_WALK_SPEED, |x, y, z| is_solid_in(chunks, x, y, z));
+        let player_feet = feet_block(self.player.position, engine_core::physics::PLAYER_HALF_HEIGHT);
+        for entity in &mut self.mobs {
+            entity.repath_timer -= dt;
+            let to_player = self.player.position - entity.mob.position;
+            let in_range = to_player.x * to_player.x + to_player.z * to_player.z
+                < MOB_SEEK_RANGE * MOB_SEEK_RANGE;
+
+            if in_range && entity.repath_timer <= 0.0 {
+                entity.repath_timer = MOB_REPATH_INTERVAL;
+                let start = feet_block(entity.mob.position, MOB_SIZE.y / 2.0);
+                entity.path = find_path(
+                    start,
+                    player_feet,
+                    |x, y, z| nav_cell(chunks, x, y, z),
+                    &NavConfig::default(),
+                )
+                .unwrap_or_default();
+                entity.path_idx = 0;
+            }
+            if !in_range {
+                entity.path.clear();
+            }
+
+            // Follow the path: steer toward the current node, advancing as the
+            // mob reaches each. Any un-steered tick lets the mob wander.
+            if let Some(node) = entity.path.get(entity.path_idx) {
+                let target = Vec3::new(node.x as f32 + 0.5, entity.mob.position.y, node.z as f32 + 0.5);
+                let delta = target - entity.mob.position;
+                if delta.x * delta.x + delta.z * delta.z < 0.35 * 0.35 {
+                    entity.path_idx += 1;
+                } else {
+                    entity.mob.steer_toward(delta.x, delta.z);
+                }
+            }
+            entity.mob.update(dt, MOB_WALK_SPEED, |x, y, z| is_solid_in(chunks, x, y, z));
         }
     }
 

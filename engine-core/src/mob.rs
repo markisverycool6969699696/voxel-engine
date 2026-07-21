@@ -56,6 +56,10 @@ pub struct Mob {
     pub on_ground: bool,
     heading: f32,
     wander_timer: f32,
+    /// A heading imposed for the next `update` (by pathfinding, etc.),
+    /// overriding wander for that tick only. Cleared once consumed, so if the
+    /// caller stops steering the mob resumes wandering on its own.
+    steering: Option<f32>,
     rng: Rng,
 }
 
@@ -63,17 +67,40 @@ impl Mob {
     pub fn new(position: Vec3, half: Vec3, seed: u64) -> Self {
         let mut rng = Rng::new(seed);
         let heading = rng.next_f32() * std::f32::consts::TAU;
-        Self { position, velocity: Vec3::ZERO, half, on_ground: false, heading, wander_timer: 0.0, rng }
+        Self {
+            position,
+            velocity: Vec3::ZERO,
+            half,
+            on_ground: false,
+            heading,
+            wander_timer: 0.0,
+            steering: None,
+            rng,
+        }
+    }
+
+    /// Steers the mob toward horizontal direction `(dx, dz)` for the next
+    /// `update` (used to follow a path). A near-zero vector is ignored. This
+    /// overrides — but does not disable — wandering: stop calling it and the
+    /// mob wanders again.
+    pub fn steer_toward(&mut self, dx: f32, dz: f32) {
+        if dx * dx + dz * dz > 1e-6 {
+            self.steering = Some(dz.atan2(dx));
+        }
     }
 
     /// Advances gravity, wander AI, and collision by `dt`. `walk_speed` is
     /// caller-provided so different mobs can share this behavior at
     /// different speeds without a new type per species.
     pub fn update(&mut self, dt: f32, walk_speed: f32, is_solid: impl Fn(i32, i32, i32) -> bool) {
-        self.wander_timer -= dt;
-        if self.wander_timer <= 0.0 {
-            self.heading = self.rng.next_f32() * std::f32::consts::TAU;
-            self.wander_timer = 1.5 + self.rng.next_f32() * 2.5;
+        if let Some(h) = self.steering.take() {
+            self.heading = h; // path-following overrides wander this tick
+        } else {
+            self.wander_timer -= dt;
+            if self.wander_timer <= 0.0 {
+                self.heading = self.rng.next_f32() * std::f32::consts::TAU;
+                self.wander_timer = 1.5 + self.rng.next_f32() * 2.5;
+            }
         }
 
         self.velocity.x = self.heading.cos() * walk_speed;
@@ -163,6 +190,24 @@ mod tests {
             m.update(1.0 / 60.0, 3.0, &wall);
             assert!(m.position.x + m.half.x < 5.0 + 1e-3, "tunneled through wall: x={}", m.position.x);
         }
+    }
+
+    #[test]
+    fn steering_overrides_wander_then_releases() {
+        let ground = |_: i32, y: i32, _: i32| y <= 0;
+        let mut m = Mob::new(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.3, 0.45, 0.3), 5);
+        // Settle on the ground first.
+        for _ in 0..60 {
+            m.update(1.0 / 60.0, 0.0, &ground);
+        }
+        // Steer hard toward +x for a while: horizontal motion should be +x.
+        let start_x = m.position.x;
+        for _ in 0..120 {
+            m.steer_toward(1.0, 0.0);
+            m.update(1.0 / 60.0, 2.0, &ground);
+        }
+        assert!(m.position.x > start_x + 1.0, "steering should drive +x motion");
+        assert!(m.position.z.abs() < 0.5, "steering +x shouldn't drift in z");
     }
 
     #[test]

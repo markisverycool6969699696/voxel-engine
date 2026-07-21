@@ -27,14 +27,16 @@ mine/place blocks in it.
   block/item registry (JSON)
 - Synthesized sound effects for mining/placing (placeholder tones, not real samples — see
   [Known Issues](#known-issues))
-- A couple of wandering placeholder mobs (gravity + collision + a random-walk heading), rendered
-  as solid-color boxes — proves the movement/collision/rendering path, not a real mob roster
+- A couple of placeholder mobs (gravity + collision, rendered as solid-color boxes) that
+  **pathfind toward the player** using voxel A* — and, crucially, refuse to route through
+  not-yet-loaded chunks, falling back to wandering when there's no valid path. Not a real mob
+  roster, but the movement/collision/pathfinding/rendering path is all real.
 
 **Not yet built:**
 - Real textures (the atlas is still procedural placeholder colors per block id) and an inventory
   UI — see `docs/STARTER.md` §8 for open decisions
-- Fluid behavior (water is currently a solid, walkable block, not a flowing fluid), pathfinding
-  mobs, multiplayer
+- Fluid behavior (water is currently a solid, walkable block, not a flowing fluid), multiplayer,
+  the macOS/Metal backend
 
 See [MEMORY.md](MEMORY.md) for the full development log, and [project.md](project.md) for planning
 notes.

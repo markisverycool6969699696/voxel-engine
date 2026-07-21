@@ -1,5 +1,14 @@
 # FOROPUS — Opus Task Scope
 
+> **Status update (2026-07-21):** Terrain generation + biome blending (`engine-core/src/worldgen.rs`)
+> and pathfinding around partially-loaded chunks (`engine-core/src/pathfind.rs`) are **DONE** — both
+> implemented, tested, and shipped this session. See MEMORY.md's two "Opus" checkpoints. The only
+> remaining §6 Opus item is a dedicated foundation-hardening review pass (optional — the terrain +
+> streaming load already soaked clean). This doc is kept as-is below for historical context / in
+> case terrain or nav needs a follow-up pass.
+
+---
+
 Opus handles the strong-reasoning tier: reviewing/hardening the foundation, the terrain
 generation pipeline, biome blending, and pathfinding around partially-loaded chunks (spec §6).
 Minimize token usage on restating context already covered below — read this file plus the

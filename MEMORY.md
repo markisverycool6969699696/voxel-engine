@@ -326,18 +326,39 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     structurally coherent (solid below, open above, water pooling correctly); eyeballing the
     aesthetics is on the user.
 
+- **Checkpoint (2026-07-21, Opus — pathfinding):** the other named Opus-tier item (STARTER.md §6,
+  "pathfinding around partially-loaded chunks"). New `engine-core/src/pathfind.rs`: voxel A* with
+  Minecraft-style step-up/fall nav. **Defining feature:** the world oracle is three-state
+  (`Solid`/`Open`/`Unknown`); `Unknown` = not-yet-loaded, treated as impassable and never guessed,
+  so a mob never paths into or across ungenerated terrain. Bounded node budget (`max_nodes`) so an
+  unreachable goal returns `None` instead of scanning an effectively infinite open world. 6 tests
+  (straight path, staircase climb, Unknown-wall blocks, node budget, floating-goal rejected,
+  detour around a pillar).
+  - `mob.rs` gained `steer_toward(dx,dz)` — imposes a heading for the next `update` only, cleared
+    after use, so path-following overrides wander per-tick without disabling it (mob wanders again
+    the moment steering stops). One new test. Existing wander tests unaffected (steering opt-in).
+  - Wired in `game/src/main.rs`: mobs are now `MobEntity { mob, path, path_idx, repath_timer }`;
+    each recomputes a path to the player's feet block every 0.5s (only within 40 blocks), steers
+    along it, advances nodes as it reaches them, and falls back to wander when `find_path` returns
+    nothing (player flying/unreachable, or path would cross unloaded chunks). `nav_cell` maps
+    `ChunkManager::block` → `Unknown` for unloaded, `Open`/`Solid` otherwise.
+  - Verified: `cargo test --workspace` 81/81 (was 74; +6 pathfind, +1 mob steering). `game.exe`
+    soaked 15s clean on the Intel Arc GPU, no panics/crashes, no leftover process.
+
 ## Next Up
-**Terrain generation is done** — the last big reserved-for-Opus milestone. The engine now has a
-complete playable loop over real streamed infinite terrain. Remaining work is incremental and
-mostly content/polish, not another foundational milestone:
+**Both Opus-tier milestones are done** (terrain generation + biome blending, and pathfinding
+around partially-loaded chunks). The remaining Opus §6 item, "reviewing/hardening the foundation,"
+got an implicit pass this session: the real terrain generator + streaming at load_radius 4 exercises
+the streaming/eviction path far harder than the old void generator ever did, and it soaked clean —
+but a dedicated fresh-eyes audit is still worthwhile if the user wants belt-and-suspenders.
+
+What's left is content/polish/port work, none of it a foundational milestone:
 - Real textures (atlas is placeholder flat colors per block id) — needs an asset-pack decision
   (STARTER.md §8), Sonnet-tier once decided.
 - Fluid behavior for water (currently a solid walkable block; `BehaviorTag::Fluid` already exists
   in the registry as the hook) — Sonnet-tier.
-- Pathfinding mobs (current `mob.rs` is flat random-walk `Wander`; pathfinding around
-  partially-loaded chunks is the remaining Opus-tier item per STARTER.md §6 / for-opus/FOROPUS.md).
-- Per-chunk GPU mesh buffers, inventory UI, save/load of modified chunks
+- Per-chunk GPU mesh buffers (perf), inventory UI, save/load of modified chunks
   (`drain_evicted_modified` is already wired for it), Metal/macOS backend, multiplayer.
-- Terrain tuning: the noise constants are a first coherent pass, not tuned to death — biome
-  sizes, cave frequency, tree density, mountain sharpness are all easy knobs in `worldgen.rs` if
-  the user wants a different feel.
+- Terrain/nav tuning: noise constants (`worldgen.rs`) and nav params (`NavConfig`, seek range/
+  repath interval in `main.rs`) are first coherent passes, easy knobs if the user wants a
+  different feel.
