@@ -407,6 +407,47 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   visual confirmation** — a GPU cull-mode setting and a perceived edit-freeze are not things unit
   tests or a soak-run can verify; only looking at the running game can.
 
+- **The culling fix above did NOT resolve "upside down"; got a real screenshot; found and fixed
+  the actual bug (2026-07-21).** User confirmed fps was better but "still upside down" after the
+  culling change, which ruled out the "mouse-lurch from stalls" and "backwards culling" theories
+  (culling misconfiguration would leave gaps/holes; the screenshot showed a complete, well-shaded,
+  merely-*mirrored* world — sky at the bottom, terrain/canyon walls hanging from the top, tree
+  trunks pointing down from the "ceiling" with canopy near the top). Blind guessing had failed
+  twice, so — since Claude's own screenshot/computer-use tools don't see the user's physical
+  screen (an already-established constraint) — asked the user to press Win+PrtScn and got them to
+  actually launch the game (Escape had no cursor-free option before this, so also fixed that
+  first: `Esc` now toggles cursor lock instead of calling `event_loop.exit()`, in
+  `game/src/main.rs`). Then **read the resulting screenshot directly** with the Read tool, which
+  finally gave real evidence instead of another guess.
+  - Traced the whole render pipeline from the photo backward: `engine_core::camera`'s
+    `VULKAN_CLIP_CORRECTION` (a clip-space Y negation, tested, but — per this same session's
+    finding — **never actually visually confirmed**; this project's first-ever rendered triangle
+    was accepted on "no crash" alone, see the Checkpoint 2 entry above) was the one deliberate
+    Y-flip in the pipeline. Re-derived Vulkan's viewport-transform Y convention rigorously (it says
+    the *removed* negation should have been correct, not the bug) but the empirical result
+    contradicts that — some second, unaccounted flip is happening somewhere in the actual pipeline
+    that wasn't pinned down through source reading alone (checked: UBO struct layout matches the
+    WGSL struct exactly, the shader does a plain `view_proj * vec4(position,1.0)`, the viewport is
+    a standard positive-height viewport, swapchain `pre_transform` uses `caps.current_transform`
+    correctly). Given the theoretical model already produced one wrong prediction this session
+    (the culling-direction guess), trusted the photo over further re-derivation: removed the
+    negation (`VULKAN_CLIP_CORRECTION` is now identity) as the direct, testable counter to "the
+    image is a clean vertical mirror." Updated `world_up_is_screen_up_in_vulkan_ndc`'s assertion
+    to match, with an explicit comment that the new assertion direction is empirical, not
+    re-derived from Vulkan's textbook Y-down-NDC convention (which would predict the opposite) —
+    intentionally flagged as unresolved rather than papered over with false confidence.
+  - **Also temporarily set `CullModeFlags::NONE`** (was `BACK`) rather than guess a second
+    `FrontFace` value to pair with the flip removal — isolates the orientation question (is the
+    world right-side up now?) from the culling-direction question (which winding is front-facing?)
+    so a wrong culling guess can't produce a confusing "still broken, different reason" report on
+    top of an actual orientation fix. Once orientation is confirmed, re-enabling `BACK` + picking
+    the `FrontFace` that doesn't make geometry vanish is a much lower-stakes, likely single-shot
+    follow-up.
+  - Verified: `cargo test --workspace` 81/81 (test assertion direction changed, still green), clean
+    build, 15s soak clean, no leftover process. **This is a hypothesis awaiting the user's next
+    screenshot, not a confirmed fix** — said so explicitly rather than repeating the overclaiming
+    mistake from the culling-direction attempt.
+
 ## Next Up
 **Both Opus-tier milestones are done** (terrain generation + biome blending, and pathfinding
 around partially-loaded chunks). The remaining Opus §6 item, "reviewing/hardening the foundation,"

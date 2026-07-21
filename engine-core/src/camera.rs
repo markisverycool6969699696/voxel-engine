@@ -3,18 +3,33 @@
 //! `glam::Mat4::perspective_rh` (the non-`_gl` variant) already targets
 //! Vulkan/D3D depth range `[0,1]` at `z_near`/`z_far` — verified in
 //! `near_and_far_planes_map_to_depth_zero_and_one` below, not just assumed
-//! from the name. The one thing it still gets wrong for Vulkan is the Y
-//! axis: clip space Y points down in Vulkan, up in the (right-handed, OpenGL-
-//! descended) convention glam's helper assumes. [`VULKAN_CLIP_CORRECTION`]
-//! flips only that.
-
+//! from the name.
+//!
+//! [`VULKAN_CLIP_CORRECTION`] is currently identity. An earlier version of
+//! this file negated clip-space Y here, on the textbook-standard theory that
+//! Vulkan's Y-down NDC needs correcting against glam's Y-up-clip convention
+//! — internally consistent, unit-tested, but **never actually visually
+//! confirmed** (this project's very first rendered triangle was accepted on
+//! "no crash" alone — see MEMORY.md). Once real terrain made the world's
+//! orientation unambiguous, a screenshot showed it rendering upside down
+//! with that negation in place (sky at the bottom, terrain/trees hanging
+//! from the top). This is the first attempt at a fix, not a confirmed one:
+//! removing the negation is the direct, testable counter to "the image is a
+//! clean vertical mirror," but exactly which stage was contributing the
+//! extra flip (UBO layout, naga's WGSL matrix codegen, something else) was
+//! not independently pinned down — if the world still renders wrong after
+//! this, that uncertainty is why, and the next step should be checking
+//! *this specific pipeline's* actual behavior empirically rather than
+//! re-deriving Vulkan's Y convention from memory again. `render_vk`'s
+//! `FrontFace` was flipped back to `CLOCKWISE` alongside this — winding-vs-
+//! culling direction depends on whether a clip-space flip is present.
 use glam::{Mat4, Vec3};
 
 /// Column-major, matches `Mat4::perspective_rh`'s convention: multiply this
 /// on the *left* of the projection matrix (`CORRECTION * perspective`).
 pub const VULKAN_CLIP_CORRECTION: Mat4 = Mat4::from_cols_array(&[
     1.0, 0.0, 0.0, 0.0,
-    0.0, -1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
     0.0, 0.0, 1.0, 0.0,
     0.0, 0.0, 0.0, 1.0,
 ]);
@@ -114,12 +129,22 @@ mod tests {
 
     #[test]
     fn world_up_is_screen_up_in_vulkan_ndc() {
-        // Vulkan NDC Y points down, so a point above the camera (world +Y)
-        // must land at *negative* NDC y once the clip correction is applied.
+        // This assertion direction is the empirical one, not the textbook
+        // one — see this module's doc comment. Standard Vulkan viewport
+        // rules (positive-height viewport, NDC y=-1 -> top row) say a point
+        // above the camera landing at *negative* NDC y is what should put it
+        // on screen-top; that's what the previous (removed) Y-negation
+        // produced, and it rendered upside down anyway. This test currently
+        // encodes the opposite (positive NDC y = up) because that's what a
+        // screenshot showed this actual pipeline needs, not because the
+        // textbook rule was re-derived and found wrong — if this pipeline's
+        // effective Y convention changes again, fix the assertion to match
+        // reality, don't "fix" reality to match a re-derivation of this
+        // comment.
         let c = Camera::new(Vec3::ZERO, 1.0);
         let above = Vec3::new(0.0, 1.0, -10.0);
         let clip = c.view_proj() * above.extend(1.0);
-        assert!(clip.y / clip.w < 0.0);
+        assert!(clip.y / clip.w > 0.0);
     }
 
     #[test]

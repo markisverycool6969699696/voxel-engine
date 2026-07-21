@@ -16,17 +16,16 @@
 //! via a descriptor set. Added a depth buffer (recreated alongside the
 //! swapchain) with standard less-than depth testing.
 //!
-//! Back-face culling (`FrontFace::COUNTER_CLOCKWISE` + `CullModeFlags::BACK`)
-//! is enabled. `CLOCKWISE` was the original guess and shipped un-reconfirmed
-//! for a while (see this file's git history / MEMORY.md) — it was backwards:
-//! it culled the near/outer faces and left only the far/inner ones, which
-//! read as the world rendering inside-out ("upside down") once real terrain
-//! (sky above, caves below) made the orientation unambiguous. `mesh.rs`'s
-//! quads are CCW-from-outside in world space; the Y-flip in
-//! `engine_core::camera`'s projection (see its docs) mirrors that to
-//! CW-from-outside once rasterized, so `COUNTER_CLOCKWISE` here is what
-//! actually keeps the outer/near faces as front-facing. If geometry vanishes
-//! or looks inside-out again, this is the first line to check.
+//! Back-face culling is **temporarily disabled** (`CullModeFlags::NONE`)
+//! while chasing a real "upside down" rendering bug confirmed by screenshot
+//! (see MEMORY.md and `engine_core::camera`'s doc comment, which just
+//! removed a clip-space Y-negation as the fix). The correct `FrontFace` for
+//! the post-fix pipeline depends on that flip's presence and wasn't
+//! independently derivable with confidence — a first attempt at deriving it
+//! for the *previous* (flipped) state was wrong (see git history), so this
+//! round deliberately isolates the orientation fix from the culling-
+//! direction guess rather than compounding two unconfirmed changes. See the
+//! rasterization state below for the re-enable plan.
 //!
 //! Sync design (the part that must be right):
 //! - `FRAMES_IN_FLIGHT = 2` frames, each with its own command buffer,
@@ -700,24 +699,27 @@ impl VkRenderer {
                 .viewport_count(1)
                 .scissor_count(1);
 
-            // See module docs: culling direction depends on the Y-flip in
-            // engine_core::camera's projection matrix. `VULKAN_CLIP_CORRECTION`
-            // negates clip-space Y to make world-up display as screen-up (see
-            // camera.rs, tested); as an unavoidable side effect that also
-            // mirrors the apparent winding of every triangle as rasterized
-            // (a single-axis flip inverts chirality). mesh.rs's quads are
-            // wound CCW-from-outside in world space; after the Y-flip they
-            // rasterize CW-from-outside, so the front face Vulkan should keep
-            // is COUNTER_CLOCKWISE here (i.e. the opposite of what a
-            // no-Y-flip pipeline would use). Previously CLOCKWISE — chosen
-            // without ever independently re-confirming culling correctness
-            // by eye (see MEMORY.md), which was exactly backwards: it culled
-            // the near/outer faces and left only the far/inner ones visible,
-            // reading as the world rendered inside-out ("upside down").
+            // Culling TEMPORARILY OFF. Context: `engine_core::camera`'s
+            // clip-space Y-flip was just removed to fix a confirmed (by
+            // screenshot) upside-down render — but which `FrontFace` value
+            // pairs correctly with "no flip" wasn't independently derivable
+            // with confidence (see camera.rs's doc comment; the theoretical
+            // model that predicted the *previous* setting was wrong once
+            // already this session). Rather than guess again and risk a
+            // second confusing "still broken, but now for a different
+            // reason" report, cull mode is NONE here so the orientation fix
+            // can be checked in isolation — a fully unculled scene should
+            // just look right-side up (if inefficient), with no separate
+            // culling-direction variable to confuse that check. Once
+            // orientation is confirmed correct, re-enable `CullModeFlags::BACK`
+            // and pick whichever `FrontFace` doesn't make geometry vanish —
+            // that follow-up no longer risks another blind full round-trip
+            // since the harder (orientation) variable will already be pinned
+            // down.
             let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::BACK)
-                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::CLOCKWISE)
                 .line_width(1.0);
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
