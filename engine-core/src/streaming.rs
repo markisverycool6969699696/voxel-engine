@@ -219,6 +219,12 @@ impl ChunkManager {
         self.columns.get(&(cx, cz)).map(|c| &c.data)
     }
 
+    /// All currently loaded columns, keyed by `(cx, cz)`. For callers that
+    /// need to iterate the whole loaded set (e.g. rebuilding a combined mesh).
+    pub fn columns(&self) -> impl Iterator<Item = ((i32, i32), &ChunkColumn)> {
+        self.columns.iter().map(|(&k, c)| (k, &c.data))
+    }
+
     pub fn block(&self, cx: i32, cz: i32, x: usize, wy: i32, z: usize) -> Option<BlockId> {
         self.columns.get(&(cx, cz))?.data.get(x, wy, z)
     }
@@ -411,6 +417,19 @@ mod tests {
         assert!(m2.set_block(0, 0, 1, 1, 1, BlockId(500)));
         assert_eq!(m2.block(0, 0, 1, 1, 1), Some(BlockId(500)));
         drop(m);
+    }
+
+    #[test]
+    fn columns_iterates_loaded_set() {
+        let mut m = mgr(1, 0, 1);
+        m.set_center(0, 0);
+        pump_until_idle(&mut m);
+        let mut keys: Vec<(i32, i32)> = m.columns().map(|(k, _)| k).collect();
+        keys.sort_unstable();
+        let mut expect: Vec<(i32, i32)> =
+            (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))).collect();
+        expect.sort_unstable();
+        assert_eq!(keys, expect);
     }
 
     #[test]

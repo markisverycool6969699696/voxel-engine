@@ -1,22 +1,25 @@
 //! Platform binary: window + event loop, driving the renderer via the
 //! `engine_core::Renderer` trait. Vulkan-only for now (Metal deferred).
 //!
-//! Scene content is a single hardcoded, mutable `PalettedSection` (no world
-//! gen yet — that's a separate, not-yet-built subsystem) run through greedy
-//! meshing, with a physics-driven player (gravity, collision, jump) and
-//! mouse-driven block mining/placing via voxel raycast. Enough to sanity
-//! check chunk data → mesh → GPU rendering → input → physics → world edit as
-//! one real loop, even though the "world" itself is still a fixed structure.
+//! World content is served through `engine_core::streaming::ChunkManager`
+//! (background-threaded, load/unload by radius around the player) rather
+//! than one hardcoded section. There is still no real terrain generator —
+//! that's a separate, not-yet-built subsystem — so `DemoGenerator` places
+//! the same hand-built demo structure at the origin column and leaves every
+//! other column empty air. This wires up the streaming/threading pipeline
+//! (multi-chunk meshing, world-space collision and raycasting, chunk-aware
+//! edits) without making any actual terrain-shape decisions.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine_core::camera::Camera;
 use engine_core::chunk::{BlockId, PalettedSection, AIR};
 use engine_core::mesh::{greedy_mesh, triangulate};
 use engine_core::physics::PlayerController;
 use engine_core::raycast::raycast_voxels;
+use engine_core::streaming::{ChunkGenerator, ChunkManager, StreamingConfig};
 use engine_core::Renderer;
 use glam::Vec3;
 use render_vk::VkRenderer;
@@ -36,15 +39,33 @@ const MAX_REACH: f32 = 6.0;
 
 const SECTION_DIM: i32 = 16;
 
+/// Streamed radius around the player, in columns. Small on purpose: with
+/// every non-origin column empty air, a wider radius would just mean more
+/// idle columns to pump/mesh for nothing visible yet.
+const STREAMING: StreamingConfig = StreamingConfig {
+    load_radius: 2,
+    unload_margin: 1,
+    initial_sections: 0..=2,
+    workers: 2,
+};
+
 /// Placeholder hotbar (number keys 1-4) until there's a real inventory —
 /// same debug-colored block ids used everywhere else, no new content.
 const HOTBAR: [BlockId; 4] = [BlockId(1), BlockId(2), BlockId(3), BlockId(4)];
 
-fn is_solid_in(section: &PalettedSection, x: i32, y: i32, z: i32) -> bool {
-    if x < 0 || y < 0 || z < 0 || x >= SECTION_DIM || y >= SECTION_DIM || z >= SECTION_DIM {
-        return false; // outside the demo section: open air/void, not solid
-    }
-    section.get(x as usize, y as usize, z as usize) != AIR
+fn is_solid_in(chunks: &ChunkManager, x: i32, y: i32, z: i32) -> bool {
+    let (cx, cz) = (x.div_euclid(SECTION_DIM), z.div_euclid(SECTION_DIM));
+    let (lx, lz) = (x.rem_euclid(SECTION_DIM) as usize, z.rem_euclid(SECTION_DIM) as usize);
+    // Ungenerated/unloaded reads as open air/void, not solid — same fallback
+    // the old single-section bounds check used.
+    chunks.block(cx, cz, lx, y, lz).is_some_and(|b| b != AIR)
+}
+
+fn world_chunk_of(pos: Vec3) -> (i32, i32) {
+    (
+        (pos.x.floor() as i32).div_euclid(SECTION_DIM),
+        (pos.z.floor() as i32).div_euclid(SECTION_DIM),
+    )
 }
 
 /// A small hand-built structure: base platform, border, center staircase,
@@ -78,6 +99,22 @@ fn build_demo_section() -> PalettedSection {
     s
 }
 
+/// Not a terrain generator: every column is empty air except the origin,
+/// which gets the same fixed demo structure `build_demo_section` always
+/// built. Exists purely so `ChunkManager` has something deterministic to
+/// hand back — real terrain shape is a separate, not-yet-started subsystem.
+struct DemoGenerator;
+
+impl ChunkGenerator for DemoGenerator {
+    fn generate(&self, cx: i32, sy: i32, cz: i32) -> PalettedSection {
+        if cx == 0 && cz == 0 && sy == 0 {
+            build_demo_section()
+        } else {
+            PalettedSection::filled(AIR)
+        }
+    }
+}
+
 #[derive(Default)]
 struct Input {
     held: HashSet<KeyCode>,
@@ -91,7 +128,8 @@ struct App {
     renderer: Option<VkRenderer>,
     camera: Camera,
     player: PlayerController,
-    section: PalettedSection,
+    chunks: ChunkManager,
+    streaming_center: Option<(i32, i32)>,
     input: Input,
     last_frame: Option<Instant>,
     selected_block: BlockId,
@@ -117,7 +155,8 @@ impl Default for App {
             renderer: None,
             camera,
             player,
-            section: build_demo_section(),
+            chunks: ChunkManager::new(Arc::new(DemoGenerator), STREAMING),
+            streaming_center: None,
             input: Input::default(),
             last_frame: None,
             selected_block: HOTBAR[0],
@@ -127,13 +166,52 @@ impl Default for App {
 }
 
 impl App {
+    /// Merges every loaded chunk's mesh into one combined buffer and uploads
+    /// it. `Renderer::set_mesh` only holds one mesh at a time, so a per-chunk
+    /// GPU resource split is future work if the streamed world grows enough
+    /// to make full-world rebuilds too slow — fine for the current small
+    /// radius.
     fn rebuild_mesh(&mut self) {
         let Some(renderer) = self.renderer.as_mut() else { return };
-        let quads = greedy_mesh(&self.section, |b| b != AIR);
-        let (vertices, indices) = triangulate(&quads);
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for ((cx, cz), column) in self.chunks.columns() {
+            for (sy, section) in column.loaded_sections() {
+                let quads = greedy_mesh(section, |b| b != AIR);
+                if quads.is_empty() {
+                    continue;
+                }
+                let (mut section_vertices, section_indices) = triangulate(&quads);
+                let offset = Vec3::new(
+                    (cx * SECTION_DIM) as f32,
+                    (sy * SECTION_DIM) as f32,
+                    (cz * SECTION_DIM) as f32,
+                );
+                for v in &mut section_vertices {
+                    v.position[0] += offset.x;
+                    v.position[1] += offset.y;
+                    v.position[2] += offset.z;
+                }
+                let base = vertices.len() as u32;
+                indices.extend(section_indices.into_iter().map(|i| i + base));
+                vertices.extend(section_vertices);
+            }
+        }
         if let Err(e) = renderer.set_mesh(&vertices, &indices) {
             eprintln!("mesh upload error: {e:#}");
         }
+    }
+
+    /// Moves the streaming radius to follow the player and integrates any
+    /// finished background generation. Returns true if the mesh needs
+    /// rebuilding (new sections landed).
+    fn update_streaming(&mut self) -> bool {
+        let center = world_chunk_of(self.player.position);
+        if self.streaming_center != Some(center) {
+            self.streaming_center = Some(center);
+            self.chunks.set_center(center.0, center.1);
+        }
+        self.chunks.pump() > 0
     }
 
     fn update_and_render(&mut self) {
@@ -175,15 +253,21 @@ impl App {
         }
         let jump = self.held(KeyCode::Space);
 
-        let section = &self.section;
-        self.player.update(dt, wish, jump, |x, y, z| is_solid_in(section, x, y, z));
+        let chunks = &self.chunks;
+        self.player.update(dt, wish, jump, |x, y, z| is_solid_in(chunks, x, y, z));
         self.camera.position = self.player.eye_position();
 
+        let mut needs_remesh = self.update_streaming();
+
         if self.input.mine_requested || self.input.place_requested {
-            self.handle_interaction();
+            needs_remesh |= self.handle_interaction();
         }
         self.input.mine_requested = false;
         self.input.place_requested = false;
+
+        if needs_remesh {
+            self.rebuild_mesh();
+        }
 
         if let Some(renderer) = self.renderer.as_mut() {
             if let Err(e) = renderer.render_frame(&self.camera) {
@@ -195,21 +279,17 @@ impl App {
         }
     }
 
-    fn handle_interaction(&mut self) {
-        let section = &self.section;
+    /// Returns true if a block was actually changed (mesh needs rebuilding).
+    fn handle_interaction(&mut self) -> bool {
+        let chunks = &self.chunks;
         let hit = raycast_voxels(self.camera.position, self.camera.forward(), MAX_REACH, |x, y, z| {
-            is_solid_in(section, x, y, z)
+            is_solid_in(chunks, x, y, z)
         });
-        let Some(hit) = hit else { return };
+        let Some(hit) = hit else { return false };
 
         let mut edited = false;
         if self.input.mine_requested {
-            if let (Ok(x), Ok(y), Ok(z)) = (
-                usize::try_from(hit.block.x),
-                usize::try_from(hit.block.y),
-                usize::try_from(hit.block.z),
-            ) {
-                self.section.set(x, y, z, AIR);
+            if self.set_world_block(hit.block, AIR) {
                 edited = true;
                 if let Some(audio) = &self.audio {
                     audio.play_mine();
@@ -217,23 +297,27 @@ impl App {
             }
         } else if self.input.place_requested {
             let target = hit.block + hit.normal;
-            if let (Ok(x), Ok(y), Ok(z)) =
-                (usize::try_from(target.x), usize::try_from(target.y), usize::try_from(target.z))
-            {
-                let already_solid = is_solid_in(&self.section, target.x, target.y, target.z);
-                let overlaps_player = aabb_contains_cell(self.player.position, target);
-                if !already_solid && !overlaps_player {
-                    self.section.set(x, y, z, self.selected_block);
-                    edited = true;
-                    if let Some(audio) = &self.audio {
-                        audio.play_place();
-                    }
+            let already_solid = is_solid_in(&self.chunks, target.x, target.y, target.z);
+            let overlaps_player = aabb_contains_cell(self.player.position, target);
+            if !already_solid && !overlaps_player && self.set_world_block(target, self.selected_block) {
+                edited = true;
+                if let Some(audio) = &self.audio {
+                    audio.play_place();
                 }
             }
         }
-        if edited {
-            self.rebuild_mesh();
-        }
+        edited
+    }
+
+    /// World-space edit, routed to the owning chunk. False (no-op) if the
+    /// containing section isn't loaded — callers already gate on `is_solid_in`
+    /// / a successful raycast hit, so this only fails for the current-frame
+    /// unlucky case of a column being evicted between raycast and edit.
+    fn set_world_block(&mut self, world: glam::IVec3, block: BlockId) -> bool {
+        let (cx, cz) = (world.x.div_euclid(SECTION_DIM), world.z.div_euclid(SECTION_DIM));
+        let (lx, lz) =
+            (world.x.rem_euclid(SECTION_DIM) as usize, world.z.rem_euclid(SECTION_DIM) as usize);
+        self.chunks.set_block(cx, cz, lx, world.y, lz, block)
     }
 
     fn held(&self, key: KeyCode) -> bool {
@@ -284,6 +368,20 @@ impl ApplicationHandler for App {
         let renderer = VkRenderer::new(window.clone()).expect("failed to init Vulkan renderer");
         self.window = Some(window);
         self.renderer = Some(renderer);
+
+        // Block briefly for the starting neighborhood so the first frame
+        // isn't an empty void — background generation is fast (the demo
+        // generator does no real work) but is still async by design.
+        let center = world_chunk_of(self.player.position);
+        self.streaming_center = Some(center);
+        self.chunks.set_center(center.0, center.1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.chunks.pending() > 0 && Instant::now() < deadline {
+            self.chunks.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.chunks.pump();
+
         self.rebuild_mesh();
         self.last_frame = Some(Instant::now());
     }
