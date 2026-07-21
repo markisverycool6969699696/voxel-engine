@@ -2,13 +2,10 @@
 //! `engine_core::Renderer` trait. Vulkan-only for now (Metal deferred).
 //!
 //! World content is served through `engine_core::streaming::ChunkManager`
-//! (background-threaded, load/unload by radius around the player) rather
-//! than one hardcoded section. There is still no real terrain generator —
-//! that's a separate, not-yet-built subsystem — so `DemoGenerator` places
-//! the same hand-built demo structure at the origin column and leaves every
-//! other column empty air. This wires up the streaming/threading pipeline
-//! (multi-chunk meshing, world-space collision and raycasting, chunk-aware
-//! edits) without making any actual terrain-shape decisions.
+//! (background-threaded, load/unload by radius around the player), fed by
+//! `engine_core::worldgen::TerrainGenerator` — real seeded heightmap terrain
+//! with biomes, water, caves, ore, and trees. The player and mobs are placed
+//! on the generated surface at startup.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,7 +18,8 @@ use engine_core::mob::Mob;
 use engine_core::physics::PlayerController;
 use engine_core::raycast::raycast_voxels;
 use engine_core::registry::{BlockDef, ItemDef, Registry};
-use engine_core::streaming::{ChunkGenerator, ChunkManager, StreamingConfig};
+use engine_core::streaming::{ChunkManager, StreamingConfig};
+use engine_core::worldgen::TerrainGenerator;
 use engine_core::Renderer;
 use glam::Vec3;
 use render_vk::VkRenderer;
@@ -41,14 +39,17 @@ const MAX_REACH: f32 = 6.0;
 
 const SECTION_DIM: i32 = 16;
 
-/// Streamed radius around the player, in columns. Small on purpose: with
-/// every non-origin column empty air, a wider radius would just mean more
-/// idle columns to pump/mesh for nothing visible yet.
+/// Fixed world seed (a real seed-selection UI is future work).
+const WORLD_SEED: u64 = 0x5EED_1234;
+
+/// Streamed radius around the player, in columns. `initial_sections` spans
+/// the full terrain height band (world y 0..127) so a column loads as solid
+/// ground, not a floating surface slice.
 const STREAMING: StreamingConfig = StreamingConfig {
-    load_radius: 2,
-    unload_margin: 1,
-    initial_sections: 0..=2,
-    workers: 2,
+    load_radius: 4,
+    unload_margin: 2,
+    initial_sections: 0..=7,
+    workers: 3,
 };
 
 /// Hotbar (number keys 1-4): item ids resolved through the data-driven
@@ -72,7 +73,7 @@ fn block_for_item(items: &Registry<ItemDef>, blocks: &Registry<BlockDef>, item_i
 
 /// Placeholder mob appearance/size — not a real mob roster, just enough to
 /// prove wandering AI + collision + rendering work end to end.
-const MOB_BLOCK: BlockId = BlockId(5);
+const MOB_BLOCK: BlockId = BlockId(12);
 const MOB_SIZE: Vec3 = Vec3::new(0.6, 0.8, 0.6);
 const MOB_WALK_SPEED: f32 = 1.5;
 
@@ -110,53 +111,6 @@ fn world_chunk_of(pos: Vec3) -> (i32, i32) {
     )
 }
 
-/// A small hand-built structure: base platform, border, center staircase,
-/// and one floating block (to eyeball depth-test occlusion). Placeholder
-/// until real world generation exists.
-fn build_demo_section() -> PalettedSection {
-    const STONE: BlockId = BlockId(1);
-    const DIRT: BlockId = BlockId(2);
-
-    let mut s = PalettedSection::filled(AIR);
-    for z in 0..16 {
-        for x in 0..16 {
-            s.set(x, 0, z, STONE);
-        }
-    }
-    for i in 0..16 {
-        s.set(i, 1, 0, DIRT);
-        s.set(i, 1, 15, DIRT);
-        s.set(0, 1, i, DIRT);
-        s.set(15, 1, i, DIRT);
-    }
-    for step in 0..4usize {
-        let y = 1 + step;
-        for x in (4 + step)..(12 - step) {
-            for z in (4 + step)..(12 - step) {
-                s.set(x, y, z, STONE);
-            }
-        }
-    }
-    s.set(8, 10, 8, DIRT);
-    s
-}
-
-/// Not a terrain generator: every column is empty air except the origin,
-/// which gets the same fixed demo structure `build_demo_section` always
-/// built. Exists purely so `ChunkManager` has something deterministic to
-/// hand back — real terrain shape is a separate, not-yet-started subsystem.
-struct DemoGenerator;
-
-impl ChunkGenerator for DemoGenerator {
-    fn generate(&self, cx: i32, sy: i32, cz: i32) -> PalettedSection {
-        if cx == 0 && cz == 0 && sy == 0 {
-            build_demo_section()
-        } else {
-            PalettedSection::filled(AIR)
-        }
-    }
-}
-
 #[derive(Default)]
 struct Input {
     held: HashSet<KeyCode>,
@@ -184,16 +138,18 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
-        // Standing on the platform near a corner, clear of the border wall
-        // and the center staircase; aspect is corrected once the window
-        // exists (see `resumed`).
+        let generator = Arc::new(TerrainGenerator::new(WORLD_SEED));
+
+        // Spawn on the generated surface at the origin column, standing just
+        // above the ground so gravity settles the player onto it.
+        let spawn_h = generator.surface_height(8, 8);
         let player = PlayerController::new(Vec3::new(
-            2.5,
-            1.0 + engine_core::physics::PLAYER_HALF_HEIGHT + 0.1,
-            2.5,
+            8.5,
+            spawn_h as f32 + engine_core::physics::PLAYER_HALF_HEIGHT + 1.0,
+            8.5,
         ));
         let mut camera = Camera::new(player.eye_position(), 1.0);
-        camera.yaw = 2.0; // facing roughly toward the staircase from this corner
+        camera.yaw = 2.0;
         camera.pitch = -0.1;
 
         let blocks = Registry::<BlockDef>::load_from_str(include_str!("../data/blocks.json"))
@@ -202,21 +158,24 @@ impl Default for App {
             .expect("data/items.json must parse");
         let selected_block = block_for_item(&items, &blocks, HOTBAR_ITEM_IDS[0]);
 
-        // Two fixed spawn points on the demo platform's flat top surface
-        // (y=1, away from the border wall and center staircase) — not a
+        // Two mobs placed on the generated surface near spawn — not a
         // spawning system, just enough to see wander AI working.
-        let mob_y = 1.0 + MOB_SIZE.y / 2.0 + 0.05;
-        let mobs = vec![
-            Mob::new(Vec3::new(12.5, mob_y, 2.5), MOB_SIZE / 2.0, 1001),
-            Mob::new(Vec3::new(2.5, mob_y, 12.5), MOB_SIZE / 2.0, 2002),
-        ];
+        let mob = |wx: i32, wz: i32, seed: u64| {
+            let h = generator.surface_height(wx, wz);
+            Mob::new(
+                Vec3::new(wx as f32 + 0.5, h as f32 + MOB_SIZE.y / 2.0 + 0.5, wz as f32 + 0.5),
+                MOB_SIZE / 2.0,
+                seed,
+            )
+        };
+        let mobs = vec![mob(12, 8, 1001), mob(5, 12, 2002)];
 
         Self {
             window: None,
             renderer: None,
             camera,
             player,
-            chunks: ChunkManager::new(Arc::new(DemoGenerator), STREAMING),
+            chunks: ChunkManager::new(generator, STREAMING),
             streaming_center: None,
             mobs,
             blocks,
@@ -454,13 +413,15 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.renderer = Some(renderer);
 
-        // Block briefly for the starting neighborhood so the first frame
-        // isn't an empty void — background generation is fast (the demo
-        // generator does no real work) but is still async by design.
+        // Block briefly for the starting neighborhood so the first frame has
+        // ground under the player instead of streaming in visibly. Real
+        // terrain generation is heavier than the old void generator, so give
+        // it a longer (still bounded) budget; whatever hasn't finished keeps
+        // streaming in normally once the loop runs.
         let center = world_chunk_of(self.player.position);
         self.streaming_center = Some(center);
         self.chunks.set_center(center.0, center.1);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while self.chunks.pending() > 0 && Instant::now() < deadline {
             self.chunks.pump();
             std::thread::sleep(Duration::from_millis(2));

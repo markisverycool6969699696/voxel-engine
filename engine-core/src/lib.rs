@@ -9,6 +9,7 @@ pub mod physics;
 pub mod raycast;
 pub mod registry;
 pub mod streaming;
+pub mod worldgen;
 
 /// A platform rendering backend.
 ///

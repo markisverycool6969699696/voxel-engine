@@ -1,7 +1,15 @@
 [
   { "id": 0, "key": "air", "hardness": 0.0, "solid": false },
-  { "id": 1, "key": "debug_stone", "hardness": 1.5, "solid": true },
-  { "id": 2, "key": "debug_dirt", "hardness": 0.5, "solid": true },
-  { "id": 3, "key": "debug_block_3", "hardness": 1.0, "solid": true },
-  { "id": 4, "key": "debug_block_4", "hardness": 1.0, "solid": true }
+  { "id": 1, "key": "stone", "hardness": 1.5, "solid": true },
+  { "id": 2, "key": "dirt", "hardness": 0.5, "solid": true },
+  { "id": 3, "key": "grass", "hardness": 0.6, "solid": true },
+  { "id": 4, "key": "sand", "hardness": 0.5, "solid": true, "tags": ["gravity"] },
+  { "id": 5, "key": "water", "hardness": 0.0, "solid": false, "tags": ["fluid"] },
+  { "id": 6, "key": "wood", "hardness": 2.0, "solid": true, "tags": ["flammable"] },
+  { "id": 7, "key": "leaves", "hardness": 0.2, "solid": true, "tags": ["flammable"] },
+  { "id": 8, "key": "snow", "hardness": 0.2, "solid": true },
+  { "id": 9, "key": "bedrock", "hardness": -1.0, "solid": true },
+  { "id": 10, "key": "coal_ore", "hardness": 3.0, "solid": true },
+  { "id": 11, "key": "iron_ore", "hardness": 3.0, "solid": true },
+  { "id": 12, "key": "mob_marker", "hardness": 0.0, "solid": true }
 ]

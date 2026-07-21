@@ -8,28 +8,33 @@ assets. See [docs/STARTER.md](docs/STARTER.md) for the full project spec.
 
 ## Status
 
-Playable core loop, no world generation yet. The world streams in multiple chunks around the
-player (background-threaded load/unload by radius), but there's still only one piece of actual
-content: a hand-built demo structure (platform, border wall, a staircase, a floating block) at
-the origin. Every other chunk is empty air — walk far enough and there's void, not more terrain,
-until a real generator exists.
+Playable, with seeded infinite terrain that streams in as you move. Coherent heightmap landscape —
+rolling hills and mountains, beaches and water at sea level, biomes (plains, forest, desert,
+snowy), underground caves, ore, and trees — all generated deterministically from a seed and
+regenerated on demand rather than stored. You spawn on the surface and can walk, fly, and
+mine/place blocks in it.
 
 **Working:**
 - Vulkan 1.3 renderer (dynamic rendering, depth testing, back-face culling) with a placeholder
   procedurally-generated texture atlas
 - Palette-compressed chunk storage and greedy meshing
+- **Seeded world generation**: layered value-noise heightmap terrain, temperature/humidity biomes
+  (with blended elevation), water below sea level, 3D-noise caves, ore, and trees — fully
+  deterministic (unmodified chunks are regenerated, never stored)
+- Background chunk streaming (multi-worker, load/unload by radius) driving the generator
 - Physics: gravity, AABB collision, jumping, and creative-mode flight (`F` to toggle)
 - Mining and placing blocks via voxel raycasting, with a hotbar backed by the data-driven
   block/item registry (JSON)
 - Synthesized sound effects for mining/placing (placeholder tones, not real samples — see
   [Known Issues](#known-issues))
-- Background chunk streaming (multi-worker, load/unload by radius), wired into the playable game
 - A couple of wandering placeholder mobs (gravity + collision + a random-walk heading), rendered
   as solid-color boxes — proves the movement/collision/rendering path, not a real mob roster
 
 **Not yet built:**
-- World generation (terrain, biomes) — a real generator is the next major milestone
-- Textures/inventory/multiplayer — see `docs/STARTER.md` §8 for open decisions
+- Real textures (the atlas is still procedural placeholder colors per block id) and an inventory
+  UI — see `docs/STARTER.md` §8 for open decisions
+- Fluid behavior (water is currently a solid, walkable block, not a flowing fluid), pathfinding
+  mobs, multiplayer
 
 See [MEMORY.md](MEMORY.md) for the full development log, and [project.md](project.md) for planning
 notes.
@@ -85,13 +90,18 @@ ABI issue) — see [MEMORY.md](MEMORY.md) for the history if you're curious.
 
 ```
 engine-core/   platform-agnostic: chunk storage, meshing, physics, camera, raycasting,
-               registry, chunk streaming
+               registry, chunk streaming, world generation, mob AI
 render-vk/     Vulkan rendering backend
-game/          binary crate tying engine-core + render-vk together
+game/          binary crate tying engine-core + render-vk together (+ data/ block/item JSON)
 ```
 
 ## Known issues
 
+- Textures are placeholder: each block id hashes to a flat-colored atlas tile, so grass/water/etc.
+  aren't their "expected" colors yet. Terrain *shape* is real; block *coloring* is a stand-in until
+  a real asset set is chosen (`docs/STARTER.md` §8).
+- Water is a solid, walkable block, not a flowing fluid — real fluid behavior (the `fluid`
+  behavior tag exists in the registry for it) is future work.
 - Sound is synthesized placeholder tones (no real sound assets — see the open decision in
   `docs/STARTER.md` §8), not a bug, just not "real" content yet.
 - Back-face culling is enabled but hasn't been independently re-confirmed by eye since being

@@ -287,16 +287,57 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     physical screen (established earlier this project), so this is verified by tests + soak-run
     only, not by eye.
 
-## Next Up
-Sound, chunk streaming, creative flight, mob AI basics, and item-registry wiring are all done.
-**This is the wall for Sonnet-tier work per the project's own AI-tiering plan (STARTER.md §6).**
-What's left that's genuinely still buildable without new content decisions is thin:
-- Per-chunk mesh buffers in `render-vk` instead of one full-world+mobs merge every frame — a
-  legitimate perf item once the streamed radius/mob count grows enough to matter; not needed yet.
-- Everything else on the "not yet built" list (a real inventory UI, multiplayer) either needs
-  content decisions flagged as open in STARTER.md §8, or is explicitly out of scope for now.
+- **Checkpoint (2026-07-21, Opus — terrain generation):** the world-gen milestone that was
+  reserved for Opus. New `engine-core/src/worldgen.rs`: `TerrainGenerator` implementing
+  `ChunkGenerator`, dropped straight into the existing streaming pipeline (no changes needed to
+  `ChunkManager`/streaming — the trait boundary Sonnet set up held). Per STARTER.md §7:
+  - **Heightmap terrain, not a 3D block field.** Deliberately a contiguous solid heightmap (stone
+    to a per-column surface height, thin soil/surface skin, water filling below sea level) so it
+    reads as coherent Minecraft-like ground, NOT scattered floating voxels. The only 3D noise is a
+    conservative cave carve applied strictly *below* the surface skin, so the visible ground is
+    never pockmarked. This was the explicit user ask ("not scattered everywhere").
+  - Layered value noise, all hand-written (no `rand`/`noise` crate): splitmix64-hashed
+    value-noise + fBm. Height = low-freq continent shape + a squared mountain mask (most of the
+    world gentle, occasional real peaks) + fine detail. Biomes from temperature/humidity fBm
+    (plains/forest/desert/snowy); surface block is discrete but sits on the continuous height
+    field, so biome edges blend in elevation rather than forming cliffs (the "biome blending" ask,
+    done on the smooth axis). Caves via 3D fBm upper-tail threshold (sparse tunnels). Ore
+    (coal/iron by depth) as sparse underground hashes. Trees stamped with a ±2 column margin so
+    trunks/leaves cross section boundaries seamlessly (computed identically from either side —
+    determinism makes this safe). SEA_LEVEL=64, terrain clamped y2..122, seed 0x5EED_1234.
+  - **Wiring** (`game/src/main.rs`): removed `DemoGenerator` + `build_demo_section` entirely;
+    `ChunkManager` now fed `TerrainGenerator`. Player + mobs spawned on the real generated surface
+    via `surface_height()`. `STREAMING` bumped to load_radius 4 / initial_sections 0..=7 (full
+    y0..127 band so columns load as solid ground) / 3 workers. Startup blocking-load deadline
+    raised 2s→10s (real gen is heavier than the void generator was).
+  - **Block/item data** (`game/data/*.json`): replaced the 4 debug placeholders with the real
+    terrain block set (stone/dirt/grass/sand/water/wood/leaves/snow/bedrock/coal_ore/iron_ore +
+    mob_marker id 12; `MOB_BLOCK` moved 5→12 so it doesn't collide with water). Hotbar now places
+    stone/dirt/sand/wood. The "final v1 block/item list" (STARTER.md §8) is now substantively
+    decided for terrain purposes.
+  - **Perf**: full 648-section startup set (9×9×8) generates in ~123ms release single-threaded
+    (measured via a throwaway example), so the startup freeze is a fraction of that across 3
+    workers — nowhere near the 10s cap.
+  - Verified: `cargo test --workspace` 74/74 passing (5 new worldgen tests: determinism,
+    solid-surface/open-above, pure-air sky, water-fills-low-areas, trees-only-on-land). `game.exe`
+    soaked 15s clean on the Intel Arc GPU, no panics/crashes, no leftover process. As always,
+    visual confirmation (does the terrain *look* right/Minecraft-like) is the user's to give — the
+    screenshot tooling here doesn't reflect their physical screen. Tests confirm the terrain is
+    structurally coherent (solid below, open above, water pooling correctly); eyeballing the
+    aesthetics is on the user.
 
-The next real milestone is a terrain generator (heightmaps, biomes, cave carving) — Opus-tier.
-**Flag this to the user and wait rather than starting it.** The world is still, structurally, one
-hand-built platform + two wandering boxes surrounded by void; nothing left in the Sonnet lane
-would change that in a way the user asked for.
+## Next Up
+**Terrain generation is done** — the last big reserved-for-Opus milestone. The engine now has a
+complete playable loop over real streamed infinite terrain. Remaining work is incremental and
+mostly content/polish, not another foundational milestone:
+- Real textures (atlas is placeholder flat colors per block id) — needs an asset-pack decision
+  (STARTER.md §8), Sonnet-tier once decided.
+- Fluid behavior for water (currently a solid walkable block; `BehaviorTag::Fluid` already exists
+  in the registry as the hook) — Sonnet-tier.
+- Pathfinding mobs (current `mob.rs` is flat random-walk `Wander`; pathfinding around
+  partially-loaded chunks is the remaining Opus-tier item per STARTER.md §6 / for-opus/FOROPUS.md).
+- Per-chunk GPU mesh buffers, inventory UI, save/load of modified chunks
+  (`drain_evicted_modified` is already wired for it), Metal/macOS backend, multiplayer.
+- Terrain tuning: the noise constants are a first coherent pass, not tuned to death — biome
+  sizes, cave frequency, tree density, mountain sharpness are all easy knobs in `worldgen.rs` if
+  the user wants a different feel.

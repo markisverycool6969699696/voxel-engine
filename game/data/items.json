@@ -1,6 +1,6 @@
 [
-  { "id": 1, "key": "debug_stone", "stack_size": 64, "places_block": "debug_stone" },
-  { "id": 2, "key": "debug_dirt", "stack_size": 64, "places_block": "debug_dirt" },
-  { "id": 3, "key": "debug_block_3", "stack_size": 64, "places_block": "debug_block_3" },
-  { "id": 4, "key": "debug_block_4", "stack_size": 64, "places_block": "debug_block_4" }
+  { "id": 1, "key": "stone", "stack_size": 64, "places_block": "stone" },
+  { "id": 2, "key": "dirt", "stack_size": 64, "places_block": "dirt" },
+  { "id": 3, "key": "sand", "stack_size": 64, "places_block": "sand" },
+  { "id": 4, "key": "wood", "stack_size": 64, "places_block": "wood" }
 ]
