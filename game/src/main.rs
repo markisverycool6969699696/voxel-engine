@@ -199,6 +199,11 @@ struct App {
     /// Throttles combined (world+mobs) GPU uploads so continuous mob motion
     /// doesn't pay `set_mesh`'s stall every frame either.
     mesh_upload_accum: f32,
+    /// Mouse-look/movement/mine-place only apply while true. `Esc` toggles
+    /// this (free the cursor to alt-tab/screenshot/etc.) instead of quitting
+    /// — closing the window (Alt+F4 / the X button) still quits via
+    /// `WindowEvent::CloseRequested`, unaffected by this.
+    cursor_locked: bool,
 }
 
 impl Default for App {
@@ -255,6 +260,7 @@ impl Default for App {
             world_indices: Vec::new(),
             world_mesh_dirty: true,
             mesh_upload_accum: 0.0,
+            cursor_locked: true,
         }
     }
 }
@@ -395,46 +401,55 @@ impl App {
             .unwrap_or(0.0);
         self.last_frame = Some(now);
 
-        self.camera.yaw += self.input.mouse_delta.0 as f32 * MOUSE_SENSITIVITY;
-        self.camera.pitch = (self.camera.pitch - self.input.mouse_delta.1 as f32 * MOUSE_SENSITIVITY)
-            .clamp(-MAX_PITCH, MAX_PITCH);
-        self.input.mouse_delta = (0.0, 0.0);
-
-        // Horizontal movement uses yaw only (not pitch) — a walking player
-        // doesn't move forward-into-the-ground just from looking down.
-        let yaw = self.camera.yaw;
-        let forward_flat = Vec3::new(yaw.sin(), 0.0, -yaw.cos());
-        let right_flat = Vec3::new(-forward_flat.z, 0.0, forward_flat.x);
+        // While the cursor is freed (Esc), the game keeps simulating (world
+        // streaming, mobs, gravity) but ignores mouse-look/movement/mine-place
+        // input — otherwise a mouse moved to click elsewhere on the desktop
+        // would also spin the camera, and a click meant for another window
+        // could register as mining.
         let mut wish = Vec3::ZERO;
-        if self.held(KeyCode::KeyW) {
-            wish += forward_flat;
-        }
-        if self.held(KeyCode::KeyS) {
-            wish -= forward_flat;
-        }
-        if self.held(KeyCode::KeyD) {
-            wish += right_flat;
-        }
-        if self.held(KeyCode::KeyA) {
-            wish -= right_flat;
-        }
-        if wish.length_squared() > 0.0 {
-            wish = wish.normalize();
-            if self.held(KeyCode::ShiftLeft) {
-                wish *= SPRINT_MULTIPLIER;
+        let mut jump = false;
+        if self.cursor_locked {
+            self.camera.yaw += self.input.mouse_delta.0 as f32 * MOUSE_SENSITIVITY;
+            self.camera.pitch = (self.camera.pitch
+                - self.input.mouse_delta.1 as f32 * MOUSE_SENSITIVITY)
+                .clamp(-MAX_PITCH, MAX_PITCH);
+
+            // Horizontal movement uses yaw only (not pitch) — a walking player
+            // doesn't move forward-into-the-ground just from looking down.
+            let yaw = self.camera.yaw;
+            let forward_flat = Vec3::new(yaw.sin(), 0.0, -yaw.cos());
+            let right_flat = Vec3::new(-forward_flat.z, 0.0, forward_flat.x);
+            if self.held(KeyCode::KeyW) {
+                wish += forward_flat;
             }
-        }
-        // Vertical control only means something while flying (creative
-        // mode); Space otherwise means jump, handled below instead.
-        if self.player.flying {
-            if self.held(KeyCode::Space) {
-                wish.y += 1.0;
+            if self.held(KeyCode::KeyS) {
+                wish -= forward_flat;
             }
-            if self.held(KeyCode::ControlLeft) {
-                wish.y -= 1.0;
+            if self.held(KeyCode::KeyD) {
+                wish += right_flat;
             }
+            if self.held(KeyCode::KeyA) {
+                wish -= right_flat;
+            }
+            if wish.length_squared() > 0.0 {
+                wish = wish.normalize();
+                if self.held(KeyCode::ShiftLeft) {
+                    wish *= SPRINT_MULTIPLIER;
+                }
+            }
+            // Vertical control only means something while flying (creative
+            // mode); Space otherwise means jump, handled below instead.
+            if self.player.flying {
+                if self.held(KeyCode::Space) {
+                    wish.y += 1.0;
+                }
+                if self.held(KeyCode::ControlLeft) {
+                    wish.y -= 1.0;
+                }
+            }
+            jump = !self.player.flying && self.held(KeyCode::Space);
         }
-        let jump = !self.player.flying && self.held(KeyCode::Space);
+        self.input.mouse_delta = (0.0, 0.0);
 
         let chunks = &self.chunks;
         self.player.update(dt, wish, jump, |x, y, z| is_solid_in(chunks, x, y, z));
@@ -445,7 +460,7 @@ impl App {
         }
         self.update_mobs(dt);
 
-        if self.input.mine_requested || self.input.place_requested {
+        if self.cursor_locked && (self.input.mine_requested || self.input.place_requested) {
             self.handle_interaction();
         }
         self.input.mine_requested = false;
@@ -526,6 +541,20 @@ impl App {
 
     fn held(&self, key: KeyCode) -> bool {
         self.input.held.contains(&key)
+    }
+
+    fn set_cursor_lock(&mut self, locked: bool) {
+        self.cursor_locked = locked;
+        let Some(window) = &self.window else { return };
+        if locked {
+            if window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+            window.set_cursor_visible(false);
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
     }
 }
 
@@ -608,7 +637,9 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 if code == KeyCode::Escape && event.state == ElementState::Pressed {
-                    event_loop.exit();
+                    // Free the cursor instead of quitting — Alt+F4 / the
+                    // window's close button still quit normally.
+                    self.set_cursor_lock(!self.cursor_locked);
                     return;
                 }
                 if event.state == ElementState::Pressed {
@@ -636,11 +667,19 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => match button {
-                MouseButton::Left => self.input.mine_requested = true,
-                MouseButton::Right => self.input.place_requested = true,
-                _ => {}
-            },
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+                if !self.cursor_locked {
+                    // Click back into the window to resume, instead of that
+                    // click registering as mine/place.
+                    self.set_cursor_lock(true);
+                } else {
+                    match button {
+                        MouseButton::Left => self.input.mine_requested = true,
+                        MouseButton::Right => self.input.place_requested = true,
+                        _ => {}
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => self.update_and_render(),
             _ => {}
         }

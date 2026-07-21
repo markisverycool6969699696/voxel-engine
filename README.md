@@ -54,7 +54,8 @@ notes.
 | Left click | Mine (break) the targeted block |
 | Right click | Place the selected block |
 | `1`–`4` | Select hotbar item |
-| `Esc` | Quit |
+| `Esc` | Free the cursor (click back in, or press `Esc` again, to resume) |
+| Alt+F4 / window close button | Quit |
 
 ## Building
 
