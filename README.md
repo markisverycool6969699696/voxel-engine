@@ -8,9 +8,11 @@ assets. See [docs/STARTER.md](docs/STARTER.md) for the full project spec.
 
 ## Status
 
-Playable core loop, no world generation yet. Right now you get one hand-built demo structure
-(platform, border wall, a staircase, a floating block) that you can walk around, look at with a
-mouse-controlled camera, and mine/place blocks in.
+Playable core loop, no world generation yet. The world streams in multiple chunks around the
+player (background-threaded load/unload by radius), but there's still only one piece of actual
+content: a hand-built demo structure (platform, border wall, a staircase, a floating block) at
+the origin. Every other chunk is empty air — walk far enough and there's void, not more terrain,
+until a real generator exists.
 
 **Working:**
 - Vulkan 1.3 renderer (dynamic rendering, depth testing, back-face culling) with a placeholder
@@ -20,9 +22,8 @@ mouse-controlled camera, and mine/place blocks in.
 - Mining and placing blocks via voxel raycasting, with a basic hotbar
 - Synthesized sound effects for mining/placing (placeholder tones, not real samples — see
   [Known Issues](#known-issues))
+- Background chunk streaming (multi-worker, load/unload by radius), wired into the playable game
 - Data-driven block/item definitions (JSON) — built and tested, not yet wired into the playable game
-- Background chunk streaming (multi-worker, load/unload by radius) — built and tested, not yet
-  wired into the playable game
 
 **Not yet built:**
 - World generation (terrain, biomes) — a real generator is the next major milestone

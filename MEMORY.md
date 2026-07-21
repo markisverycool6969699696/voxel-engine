@@ -215,11 +215,26 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     needing or triggering them at all, not just by reading the `[target]` scoping.
 
 - **Repo state:** pushed to GitHub — https://github.com/markisverycool6969699696/voxel-engine
-  (public, AGPLv3). Sound-integration commit (audio.rs + rodio dependency + MSVC toolchain
-  override) is written up here but **not yet committed** — do that next, along with a note that
-  the repo now targets MSVC by default (via `rust-toolchain` override file, not just local rustup
-  state, so a fresh clone builds correctly too — check `rustup override set` actually persisted
-  something committable, or add an explicit `rust-toolchain.toml` if not).
+  (public, AGPLv3). Sound-integration commit landed (`fb15671`), README updated (`7b66baa`).
+  MSVC targeting is committed via `rust-toolchain.toml`, so a fresh clone builds correctly without
+  any local `rustup override` state.
+
+- **Checkpoint (2026-07-21, Sonnet):** wired `engine_core::streaming::ChunkManager` into
+  `game/src/main.rs` — the game now streams a multi-column world (load/unload by radius around the
+  player) instead of editing one hardcoded section directly. Mesh rebuild merges every loaded
+  column's sections into one combined buffer (world-offset by `cx/cz/sy * 16`); mining/placing
+  route through `ChunkManager::set_block` via world↔chunk coordinate math; `ChunkManager::set_center`
+  is called every frame off the player's chunk position (no-op if unchanged). Added
+  `ChunkManager::columns()` (iterate the loaded set) to `engine-core/src/streaming.rs` — the one
+  new engine-core API surface this needed, with a test.
+  - **Did not write a terrain generator.** `DemoGenerator` (in `game/src/main.rs`) places the same
+    fixed hand-built demo structure at the origin column and returns empty air for every other
+    column — zero new world-content decisions, purely there so `ChunkManager` has something
+    deterministic to call. Walking far from spawn currently means walking into void (expected: no
+    floor exists there yet). Real terrain shape/heightmaps/biomes is still Opus's call.
+  - Verified: `cargo test --workspace` 58/58 passing (was 57 — added the `columns()` test).
+    `game.exe` soaked 6s clean on the Intel Arc GPU, no panics/crashes in stdout/stderr.
+    Committed as `8cb6c90`, pushed.
 
 ## Environment Notes
 - **This repo now targets the MSVC toolchain** (`rustup override set stable-x86_64-pc-windows-msvc`,
@@ -238,19 +253,23 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   `x86_64-w64-mingw32-gcc -print-file-name=libc++.a` if so.
 
 ## Next Up
-**Resume here first**: the in-progress sound/MSVC toolchain switch above. As of the pause,
-`winget install ... Microsoft.VisualStudio.2022.BuildTools` had only printed "Starting package
-install..." — likely still mid-install (it's a multi-GB download+install, can take 15-20+ min).
-Check whether it finished (`Get-Command link.exe`), and if the background shell task is still
-listed as running, before doing anything else with the toolchain.
+Sound is fixed (MSVC toolchain), and chunk streaming is wired end to end with a no-content
+placeholder generator. Remaining engineering-only Sonnet-tier candidates that don't require
+deciding any world content:
+1. Per-chunk mesh buffers in `render-vk` instead of one full-world merge every rebuild — only
+   matters once the streamed radius/edit frequency gets big enough for full rebuilds to show up as
+   a real cost; not needed yet at the current small radius (5×5 columns).
+2. Creative-mode basics (fly/noclip toggle, unlimited hotbar) — pure input/physics-mode work, no
+   content decisions.
+3. Item system implementation (wiring the already-built `Registry<ItemDef>` into the hotbar/
+   inventory instead of the current raw `BlockId` array) — plumbing, not content, as long as the
+   actual item list stays a placeholder/test fixture.
+4. Mob AI basics — movement/pathfinding scaffolding only; actual mob roster/behavior content is
+   likely Opus's call same as blocks/items were flagged in STARTER.md §8.
 
-After that's resolved (working or not), remaining Sonnet-tier work — none of these require Opus:
-1. Commit + push once sound is confirmed working (or confirmed still blocked, with findings noted).
-2. Wiring `engine_core::streaming::ChunkManager` into `game/src/main.rs` for a multi-chunk world.
-   Caution: needs *some* `ChunkGenerator` to produce content, and deciding what a chunk generator
-   should output is real world-gen content — that's Opus's call per the tiering plan, not something
-   to improvise here even as a "placeholder." **This is likely the last Sonnet-tier item before
-   the project genuinely needs Opus for world generation.**
-
-Real world generation (terrain gen pipeline, biome blending) is Opus-tier per the project's own
-AI-tiering plan — flag it, don't build it, once item 2 above is reached.
+**This is genuinely close to the wall for Sonnet-tier work.** The next big-value step for the
+project — a real terrain generator (heightmaps, biomes, cave carving) — is Opus-tier per the
+project's own AI-tiering plan. Everything else above is incremental polish around a world that's
+still, structurally, one hand-built platform surrounded by void. Flag this to the user rather than
+picking item 1-4 unprompted; confirm which (if any) they want before Opus, since they may prefer to
+go straight to world gen.
