@@ -144,17 +144,76 @@ fn menu_option_rect(index: usize, count: usize) -> (f32, f32, f32, f32) {
     (0.0, cy, MENU_BAR_W, MENU_BAR_H / 2.0)
 }
 
-/// Full-screen backdrop plus one colored bar per option. No text rendering
-/// exists yet (no font atlas — same open decision as real block textures),
-/// so each option is a distinct flat color rather than a label; callers pick
-/// a stable, memorable color per option (see `main.rs`'s menu option list).
-pub fn menu_mesh(colors: &[[f32; 4]]) -> (Vec<UiVertex>, Vec<u32>) {
+/// One glyph's 3-wide × 5-tall pixel bitmap, one `u8` per row (bit 2 = left
+/// column, bit 1 = middle, bit 0 = right). No font atlas/asset exists (same
+/// open decision as real block textures — see `docs/STARTER.md` §8), so
+/// this draws letters the same way everything else placeholder in this
+/// project is drawn: procedurally, as plain colored quads, not sampled from
+/// an image. Only the handful of uppercase letters the menu actually needs
+/// are defined; unsupported characters (including lowercase — callers should
+/// pass already-uppercase text) are silently skipped by `text_mesh`, which
+/// is fine for the short fixed menu labels this exists for.
+fn glyph(c: char) -> Option<[u8; 5]> {
+    Some(match c {
+        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'C' => [0b011, 0b100, 0b100, 0b100, 0b011],
+        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
+        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'O' => [0b010, 0b101, 0b101, 0b101, 0b010],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'S' => [0b011, 0b100, 0b010, 0b001, 0b110],
+        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b010],
+        'V' => [0b101, 0b101, 0b101, 0b010, 0b010],
+        ' ' => [0, 0, 0, 0, 0],
+        _ => return None,
+    })
+}
+
+const FONT_PIXEL: f32 = 0.010;
+const FONT_STEP: f32 = FONT_PIXEL * 2.2;
+const FONT_CHAR_ADVANCE: f32 = FONT_STEP * 4.0; // 3 glyph columns + 1 column of inter-char gap
+
+/// Renders `text` as a horizontally-centered row of tiny pixel-quads on
+/// `(cx, cy)`. Unsupported characters (see `glyph`) are skipped rather than
+/// erroring — cosmetic UI text shouldn't be able to panic the game.
+pub fn text_mesh(text: &str, cx: f32, cy: f32, color: [f32; 4]) -> (Vec<UiVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let total_w = chars.len() as f32 * FONT_CHAR_ADVANCE;
+    let start_x = cx - total_w / 2.0 + FONT_CHAR_ADVANCE / 2.0;
+    for (i, &c) in chars.iter().enumerate() {
+        let Some(rows) = glyph(c.to_ascii_uppercase()) else { continue };
+        let glyph_cx = start_x + i as f32 * FONT_CHAR_ADVANCE;
+        for (row, bits) in rows.iter().enumerate() {
+            let py = cy + FONT_STEP * 2.0 - row as f32 * FONT_STEP;
+            for col in 0..3u32 {
+                if bits & (1 << (2 - col)) != 0 {
+                    let px = glyph_cx - FONT_STEP + col as f32 * FONT_STEP;
+                    push_quad(&mut vertices, &mut indices, px, py, FONT_PIXEL, FONT_PIXEL, color);
+                }
+            }
+        }
+    }
+    (vertices, indices)
+}
+
+/// Full-screen backdrop plus one colored, labeled bar per `(label, color)`
+/// option.
+pub fn menu_mesh(options: &[(&str, [f32; 4])]) -> (Vec<UiVertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     push_quad(&mut vertices, &mut indices, 0.0, 0.0, 1.0, 1.0, [0.03, 0.03, 0.05, 0.92]);
-    for (i, &color) in colors.iter().enumerate() {
-        let (cx, cy, hw, hh) = menu_option_rect(i, colors.len());
+    for (i, &(label, color)) in options.iter().enumerate() {
+        let (cx, cy, hw, hh) = menu_option_rect(i, options.len());
         push_quad(&mut vertices, &mut indices, cx, cy, hw, hh, color);
+        let (text_v, text_i) = text_mesh(label, cx, cy, [0.05, 0.05, 0.05, 1.0]);
+        let base = vertices.len() as u32;
+        indices.extend(text_i.into_iter().map(|i| i + base));
+        vertices.extend(text_v);
     }
     (vertices, indices)
 }
@@ -240,6 +299,34 @@ mod tests {
                 let (bx, by, _, bhh) = rects[j];
                 assert!(ax == bx && (ay - by).abs() >= ahh + bhh, "options {i} and {j} overlap");
             }
+        }
+    }
+
+    #[test]
+    fn text_mesh_draws_every_supported_letter() {
+        // One quad per lit pixel; every glyph this project actually uses
+        // (CREATIVE / SURVIVAL / LOAD) has at least one lit pixel per row,
+        // so a run through all of them should never come back empty.
+        for word in ["CREATIVE", "SURVIVAL", "LOAD"] {
+            let (vertices, indices) = text_mesh(word, 0.0, 0.0, [1.0, 1.0, 1.0, 1.0]);
+            assert!(!vertices.is_empty(), "{word} produced no geometry");
+            assert_eq!(indices.len(), vertices.len() / 4 * 6);
+        }
+    }
+
+    #[test]
+    fn text_mesh_skips_unsupported_characters_without_panicking() {
+        // Lowercase and punctuation aren't in the font; must be silently
+        // skipped, never panic (this is cosmetic UI text).
+        let (vertices, indices) = text_mesh("xyz!?", 0.0, 0.0, [1.0, 1.0, 1.0, 1.0]);
+        assert!(vertices.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn glyph_is_defined_for_every_letter_the_menu_uses() {
+        for c in "CREATIVSULOAD ".chars() {
+            assert!(glyph(c).is_some(), "no glyph for {c:?}");
         }
     }
 

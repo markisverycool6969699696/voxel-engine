@@ -104,21 +104,33 @@ fn face_shade(normal: [f32; 3]) -> f32 {
 /// unique to that quad (no shared-vertex smoothing wanted between
 /// differently-shaded faces anyway).
 ///
-/// UV is always the unit square per corner regardless of the quad's merged
-/// size — a texture stretches to fill the whole merged face rather than
-/// repeating once per block. Correct per-block tiling needs the shader to
-/// `fract()` an unwrapped block-space coordinate instead; deliberately
-/// skipped for this placeholder pass (no real textures to tile yet either),
-/// noted here so it isn't mistaken for an oversight later.
+/// UV spans `0..width` and `0..height` in block units (not the unit square)
+/// — the shader `fract()`s it before sampling, so the tile repeats once per
+/// block instead of stretching one tile across the whole merged face. A
+/// merged quad's edges are exactly its block-space width/height since the
+/// underlying grid is unit blocks, so this needs no extra data, just reading
+/// the quad's own corners.
 pub fn triangulate(quads: &[Quad]) -> (Vec<MeshVertex>, Vec<u32>) {
-    const UNIT_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     let mut vertices = Vec::with_capacity(quads.len() * 4);
     let mut indices = Vec::with_capacity(quads.len() * 6);
     for quad in quads {
         let base = vertices.len() as u32;
         let tile = tile_for_block(quad.block);
         let shade = face_shade(quad.normal);
-        for (corner, uv) in quad.corners.into_iter().zip(UNIT_UVS) {
+        let edge = |a: usize, b: usize| {
+            [
+                quad.corners[b][0] - quad.corners[a][0],
+                quad.corners[b][1] - quad.corners[a][1],
+                quad.corners[b][2] - quad.corners[a][2],
+            ]
+        };
+        // Axis-aligned rectangle: exactly one component of each edge vector
+        // is nonzero, so summing absolute components recovers its length.
+        let len = |w: [f32; 3]| w[0].abs() + w[1].abs() + w[2].abs();
+        let width = len(edge(0, 1));
+        let height = len(edge(0, 3));
+        let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]];
+        for (corner, uv) in quad.corners.into_iter().zip(uvs) {
             vertices.push(MeshVertex { position: corner, normal: quad.normal, uv, tile, shade });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -465,14 +477,27 @@ mod tests {
     }
 
     #[test]
-    fn triangulate_uv_is_unit_square_per_corner() {
-        let quad = Quad {
+    fn triangulate_uv_scales_with_merged_quad_size() {
+        // A 1x1 quad still gets the unit square...
+        let unit = Quad {
+            corners: [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]],
+            normal: [0.0, 1.0, 0.0],
+            block: STONE,
+        };
+        let (v, _) = triangulate(&[unit]);
+        let uvs: Vec<_> = v.iter().map(|v| v.uv).collect();
+        assert_eq!(uvs, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+
+        // ...but a 3x2 merged quad's UV spans 0..3 / 0..2, not 0..1 — the
+        // shader `fract()`s this to repeat the tile once per block instead
+        // of stretching it across the whole merged face.
+        let merged = Quad {
             corners: [[0.0, 1.0, 0.0], [3.0, 1.0, 0.0], [3.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
             normal: [0.0, 1.0, 0.0],
             block: STONE,
         };
-        let (vertices, _) = triangulate(&[quad]);
-        let uvs: Vec<_> = vertices.iter().map(|v| v.uv).collect();
-        assert_eq!(uvs, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        let (v, _) = triangulate(&[merged]);
+        let uvs: Vec<_> = v.iter().map(|v| v.uv).collect();
+        assert_eq!(uvs, vec![[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]]);
     }
 }

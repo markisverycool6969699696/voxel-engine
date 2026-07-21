@@ -430,8 +430,8 @@ impl App {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         if self.state == AppState::MainMenu {
-            let colors = Self::menu_colors();
-            let (menu_v, menu_i) = ui::menu_mesh(&colors);
+            let entries = Self::menu_entries();
+            let (menu_v, menu_i) = ui::menu_mesh(&entries);
             indices.extend(menu_i);
             vertices.extend(menu_v);
         } else if self.inventory_open {
@@ -483,13 +483,13 @@ impl App {
         opts
     }
 
-    fn menu_colors() -> Vec<[f32; 4]> {
+    fn menu_entries() -> Vec<(&'static str, [f32; 4])> {
         Self::menu_options()
             .iter()
             .map(|opt| match opt {
-                MenuOption::NewCreative => [0.25, 0.7, 0.3, 1.0],
-                MenuOption::NewSurvival => [0.75, 0.35, 0.2, 1.0],
-                MenuOption::LoadWorld => [0.3, 0.45, 0.8, 1.0],
+                MenuOption::NewCreative => ("CREATIVE", [0.25, 0.7, 0.3, 1.0]),
+                MenuOption::NewSurvival => ("SURVIVAL", [0.75, 0.35, 0.2, 1.0]),
+                MenuOption::LoadWorld => ("LOAD", [0.3, 0.45, 0.8, 1.0]),
             })
             .collect()
     }
