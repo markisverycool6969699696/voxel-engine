@@ -131,6 +131,42 @@ pub fn inventory_hit_test(x: f32, y: f32, count: usize, aspect: f32) -> Option<u
     })
 }
 
+const MENU_BAR_W: f32 = 0.5;
+const MENU_BAR_H: f32 = 0.12;
+const MENU_GAP: f32 = 0.04;
+
+/// Center + half-extent of the `index`-th of `count` stacked menu bars, in
+/// NDC. Single source of truth shared by `menu_mesh` and `menu_hit_test`,
+/// same reasoning as `inventory_cell_rect`.
+fn menu_option_rect(index: usize, count: usize) -> (f32, f32, f32, f32) {
+    let total_h = count as f32 * MENU_BAR_H + (count as f32 - 1.0) * MENU_GAP;
+    let cy = -total_h / 2.0 + MENU_BAR_H / 2.0 + index as f32 * (MENU_BAR_H + MENU_GAP);
+    (0.0, cy, MENU_BAR_W, MENU_BAR_H / 2.0)
+}
+
+/// Full-screen backdrop plus one colored bar per option. No text rendering
+/// exists yet (no font atlas — same open decision as real block textures),
+/// so each option is a distinct flat color rather than a label; callers pick
+/// a stable, memorable color per option (see `main.rs`'s menu option list).
+pub fn menu_mesh(colors: &[[f32; 4]]) -> (Vec<UiVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    push_quad(&mut vertices, &mut indices, 0.0, 0.0, 1.0, 1.0, [0.03, 0.03, 0.05, 0.92]);
+    for (i, &color) in colors.iter().enumerate() {
+        let (cx, cy, hw, hh) = menu_option_rect(i, colors.len());
+        push_quad(&mut vertices, &mut indices, cx, cy, hw, hh, color);
+    }
+    (vertices, indices)
+}
+
+/// Which menu option index (if any) NDC point `(x, y)` lands inside.
+pub fn menu_hit_test(x: f32, y: f32, count: usize) -> Option<usize> {
+    (0..count).find(|&i| {
+        let (cx, cy, hw, hh) = menu_option_rect(i, count);
+        (x - cx).abs() <= hw && (y - cy).abs() <= hh
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +216,29 @@ mod tests {
             assert_eq!(a, b);
             for channel in a {
                 assert!((0.0..=1.0).contains(&channel), "channel out of range: {channel}");
+            }
+        }
+    }
+
+    #[test]
+    fn menu_hit_test_finds_every_option_at_its_own_center() {
+        for count in [2usize, 3, 4] {
+            for i in 0..count {
+                let (cx, cy, _, _) = menu_option_rect(i, count);
+                assert_eq!(menu_hit_test(cx, cy, count), Some(i), "count={count} index={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn menu_options_do_not_overlap() {
+        let count = 3;
+        let rects: Vec<_> = (0..count).map(|i| menu_option_rect(i, count)).collect();
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                let (ax, ay, _, ahh) = rects[i];
+                let (bx, by, _, bhh) = rects[j];
+                assert!(ax == bx && (ay - by).abs() >= ahh + bhh, "options {i} and {j} overlap");
             }
         }
     }

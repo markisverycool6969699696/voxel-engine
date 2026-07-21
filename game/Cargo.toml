@@ -11,3 +11,5 @@ anyhow = { workspace = true }
 glam = { workspace = true }
 winit = { workspace = true }
 rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

@@ -560,6 +560,8 @@ dependencies = [
  "glam",
  "render-vk",
  "rodio",
+ "serde",
+ "serde_json",
  "winit",
 ]
 

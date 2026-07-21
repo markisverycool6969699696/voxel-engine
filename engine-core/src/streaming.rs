@@ -68,6 +68,11 @@ pub struct ChunkManager {
     workers: Vec<JoinHandle<()>>,
     in_flight: usize,
     evicted_modified: Vec<((i32, i32), ChunkColumn)>,
+    /// Saved (previously player-modified) sections not yet applied because
+    /// their column hadn't loaded yet when [`Self::load_saved`] ran. Consulted
+    /// in [`Self::pump`] so a save-file section overrides fresh generation no
+    /// matter when/whether that column happens to already be resident.
+    pending_overlay: HashMap<(i32, i32, i32), PalettedSection>,
 }
 
 impl ChunkManager {
@@ -109,7 +114,41 @@ impl ChunkManager {
             workers,
             in_flight: 0,
             evicted_modified: Vec::new(),
+            pending_overlay: HashMap::new(),
         }
+    }
+
+    /// Applies previously-saved (player-modified) columns so they override
+    /// fresh generation. Sections belonging to an already-loaded column are
+    /// overwritten immediately; sections for columns not loaded yet are
+    /// stashed and applied the moment that section's generation result
+    /// arrives (see `pump`). Safe to call at any time — before the first
+    /// `set_center`, or after gameplay has already streamed some of the
+    /// world in — the two paths above cover both cases.
+    pub fn load_saved(&mut self, saved: Vec<((i32, i32), ChunkColumn)>) {
+        for ((cx, cz), column) in saved {
+            for (sy, section) in column.loaded_sections() {
+                if let Some(col) = self.columns.get_mut(&(cx, cz)) {
+                    col.data.insert_section(sy, section.clone());
+                    col.modified.insert(sy);
+                } else {
+                    self.pending_overlay.insert((cx, sy, cz), section.clone());
+                }
+            }
+        }
+    }
+
+    /// Snapshot of every currently-loaded column with at least one
+    /// player-modified section (clone; doesn't evict them). Combine with
+    /// [`Self::drain_evicted_modified`] to get the complete modified set for
+    /// a save — columns that were evicted earlier this session are already
+    /// gone from `self.columns` and only live in the evicted list.
+    pub fn modified_columns(&self) -> Vec<((i32, i32), ChunkColumn)> {
+        self.columns
+            .iter()
+            .filter(|(_, col)| !col.modified.is_empty())
+            .map(|(&k, col)| (k, col.data.clone()))
+            .collect()
     }
 
     /// Moves the streaming center (player chunk position): queues generation
@@ -199,7 +238,12 @@ impl ChunkManager {
                         // (edit → modified section already inserted): never
                         // clobber modified data with freshly generated data.
                         if !col.modified.contains(&sy) {
-                            col.data.insert_section(sy, section);
+                            if let Some(saved) = self.pending_overlay.remove(&(cx, sy, cz)) {
+                                col.data.insert_section(sy, saved);
+                                col.modified.insert(sy);
+                            } else {
+                                col.data.insert_section(sy, section);
+                            }
                             applied += 1;
                         }
                     }
@@ -430,6 +474,47 @@ mod tests {
             (-1..=1).flat_map(|x| (-1..=1).map(move |z| (x, z))).collect();
         expect.sort_unstable();
         assert_eq!(keys, expect);
+    }
+
+    #[test]
+    fn load_saved_overrides_an_already_loaded_column() {
+        let mut m = mgr(0, 0, 1);
+        m.set_center(0, 0);
+        pump_until_idle(&mut m);
+        let mut saved_col = ChunkColumn::new();
+        saved_col.insert_section(0, PalettedSection::filled(BlockId(999)));
+        m.load_saved(vec![((0, 0), saved_col)]);
+        assert_eq!(m.block(0, 0, 3, 3, 3), Some(BlockId(999)));
+        // Overridden data counts as modified, so it survives an evict like any player edit.
+        m.set_center(50, 50);
+        pump_until_idle(&mut m);
+        let evicted = m.drain_evicted_modified();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].1.get(3, 3, 3), Some(BlockId(999)));
+    }
+
+    #[test]
+    fn load_saved_applies_once_the_column_streams_in() {
+        let mut m = mgr(0, 0, 1);
+        // Not loaded yet — load_saved must stash this for pump() to apply later.
+        let mut saved_col = ChunkColumn::new();
+        saved_col.insert_section(0, PalettedSection::filled(BlockId(888)));
+        m.load_saved(vec![((0, 0), saved_col)]);
+        m.set_center(0, 0);
+        pump_until_idle(&mut m);
+        assert_eq!(m.block(0, 0, 3, 3, 3), Some(BlockId(888)));
+    }
+
+    #[test]
+    fn modified_columns_snapshots_without_evicting() {
+        let mut m = mgr(0, 0, 1);
+        m.set_center(0, 0);
+        pump_until_idle(&mut m);
+        assert!(m.set_block(0, 0, 2, 2, 2, BlockId(42)));
+        let snap = m.modified_columns();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].1.get(2, 2, 2), Some(BlockId(42)));
+        assert!(m.column(0, 0).is_some()); // still loaded, not evicted
     }
 
     #[test]

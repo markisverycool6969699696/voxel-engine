@@ -32,6 +32,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 mod audio;
 use audio::Audio;
+mod save;
 mod ui;
 
 const SPRINT_MULTIPLIER: f32 = 1.6;
@@ -63,6 +64,26 @@ const STREAMING: StreamingConfig = StreamingConfig {
 enum GameMode {
     Creative,
     Survival,
+}
+
+/// Pre-gameplay screen shown on launch: pick a fresh Creative/Survival world
+/// or continue the one saved last session. `MainMenu` pauses world/mob/
+/// physics simulation (see `update_and_render`) but the world is already
+/// generated/streamed underneath it — the menu is just a UI overlay + input
+/// gate on top of the same `App`, not a separate app/window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AppState {
+    MainMenu,
+    InGame,
+}
+
+/// Menu options, in display order. `LoadWorld` only appears when a save
+/// file actually exists (see `App::menu_options`).
+#[derive(Clone, Copy, Debug)]
+enum MenuOption {
+    NewCreative,
+    NewSurvival,
+    LoadWorld,
 }
 
 /// Hotbar (number keys 1-4): item ids resolved through the data-driven
@@ -244,6 +265,9 @@ struct App {
     /// — lets the player choose it up front instead). Survival forces
     /// flight off; Creative allows `F` to toggle it as before.
     game_mode: GameMode,
+    /// Starts at `MainMenu`; a menu click moves it to `InGame` and never
+    /// back (no "return to menu" key exists yet).
+    state: AppState,
 }
 
 impl Default for App {
@@ -318,6 +342,7 @@ impl Default for App {
             cursor_locked: true,
             inventory_open: false,
             game_mode: GameMode::Creative,
+            state: AppState::MainMenu,
         }
     }
 }
@@ -404,7 +429,12 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        if self.inventory_open {
+        if self.state == AppState::MainMenu {
+            let colors = Self::menu_colors();
+            let (menu_v, menu_i) = ui::menu_mesh(&colors);
+            indices.extend(menu_i);
+            vertices.extend(menu_v);
+        } else if self.inventory_open {
             let items = inventory_items(&self.items, &self.blocks);
             let selected_id = items
                 .iter()
@@ -441,6 +471,113 @@ impl App {
         if mode == GameMode::Survival && self.player.flying {
             self.player.toggle_flying();
         }
+    }
+
+    /// `LoadWorld` only appears once a save file actually exists — nothing
+    /// to load on a machine's first-ever launch.
+    fn menu_options() -> Vec<MenuOption> {
+        let mut opts = vec![MenuOption::NewCreative, MenuOption::NewSurvival];
+        if save::save_exists() {
+            opts.push(MenuOption::LoadWorld);
+        }
+        opts
+    }
+
+    fn menu_colors() -> Vec<[f32; 4]> {
+        Self::menu_options()
+            .iter()
+            .map(|opt| match opt {
+                MenuOption::NewCreative => [0.25, 0.7, 0.3, 1.0],
+                MenuOption::NewSurvival => [0.75, 0.35, 0.2, 1.0],
+                MenuOption::LoadWorld => [0.3, 0.45, 0.8, 1.0],
+            })
+            .collect()
+    }
+
+    fn handle_menu_click(&mut self) {
+        let Some(window) = &self.window else { return };
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let ndc_x = (self.input.cursor_pos.0 / size.width as f64) as f32 * 2.0 - 1.0;
+        let ndc_y = (self.input.cursor_pos.1 / size.height as f64) as f32 * 2.0 - 1.0;
+        let options = Self::menu_options();
+        let Some(idx) = ui::menu_hit_test(ndc_x, ndc_y, options.len()) else { return };
+        match options[idx] {
+            MenuOption::NewCreative => self.start_new_world(GameMode::Creative),
+            MenuOption::NewSurvival => self.start_new_world(GameMode::Survival),
+            MenuOption::LoadWorld => self.load_saved_world(),
+        }
+    }
+
+    /// The world is already generated/streamed by the time the menu shows
+    /// (see `resumed`) — "new" just means "use it as-is, ignore any save
+    /// file" rather than actually regenerating anything.
+    fn start_new_world(&mut self, mode: GameMode) {
+        self.set_game_mode(mode);
+        self.state = AppState::InGame;
+        self.set_cursor_lock(true);
+    }
+
+    /// Falls back to a fresh Creative world if the save is missing/corrupt
+    /// rather than leaving the player stuck on a menu option that can't work.
+    fn load_saved_world(&mut self) {
+        let Some(saved) = save::load_world() else {
+            self.start_new_world(GameMode::Creative);
+            return;
+        };
+        // Mark sections dirty *before* handing ownership to `load_saved` —
+        // any of these already loaded (from resumed()'s startup neighborhood)
+        // just got silently overwritten underneath the mesh cache, which
+        // otherwise has no way to know they changed.
+        for ((cx, cz), column) in &saved.columns {
+            for (sy, _) in column.loaded_sections() {
+                self.dirty_sections.insert((*cx, sy, *cz));
+            }
+        }
+        self.chunks.load_saved(saved.columns);
+        self.player.position = Vec3::from_array(saved.player_pos);
+        self.camera.yaw = saved.yaw;
+        self.camera.pitch = saved.pitch;
+        self.set_game_mode(if saved.creative { GameMode::Creative } else { GameMode::Survival });
+
+        // The saved position may be far from wherever resumed()'s startup
+        // load centered on — re-center and give streaming the same bounded
+        // blocking budget so the player doesn't drop into an unloaded void.
+        let center = world_chunk_of(self.player.position);
+        self.streaming_center = Some(center);
+        self.chunks.set_center(center.0, center.1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.chunks.pending() > 0 && Instant::now() < deadline {
+            self.chunks.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.chunks.pump();
+
+        self.world_mesh_dirty = true;
+        self.state = AppState::InGame;
+        self.set_cursor_lock(true);
+        self.rebuild_world_mesh();
+        self.upload_combined_mesh();
+    }
+
+    /// Only the diff is saved: currently-loaded modified sections plus
+    /// whatever was already evicted-with-edits earlier this session —
+    /// unmodified terrain regenerates identically from `WORLD_SEED`, so
+    /// there's nothing to gain (and a lot of disk to spend) saving it too.
+    fn save_current_world(&mut self) {
+        let mut columns = self.chunks.drain_evicted_modified();
+        columns.extend(self.chunks.modified_columns());
+        let save = save::WorldSave {
+            seed: WORLD_SEED,
+            creative: self.game_mode == GameMode::Creative,
+            player_pos: self.player.position.to_array(),
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+            columns,
+        };
+        save::save_world(&save);
     }
 
     /// Hit-tests the last known cursor position against the inventory grid;
@@ -525,6 +662,20 @@ impl App {
             .map(|prev| (now - prev).as_secs_f32())
             .unwrap_or(0.0);
         self.last_frame = Some(now);
+
+        if self.state == AppState::MainMenu {
+            // Paused: no physics/streaming/mobs, just present whatever the
+            // last frame already had underneath the menu overlay.
+            if let Some(renderer) = self.renderer.as_mut() {
+                if let Err(e) = renderer.render_frame(&self.camera) {
+                    eprintln!("render error: {e:#}");
+                }
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
 
         // While the cursor is freed (Esc), the game keeps simulating (world
         // streaming, mobs, gravity) but ignores mouse-look/movement/mine-place
@@ -711,14 +862,6 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        // Mouse-look: hide the cursor and keep it from leaving the window.
-        // `Locked` (recenters every frame) is nicer but not universally
-        // supported; fall back to `Confined` rather than failing outright.
-        if window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
-            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-        }
-        window.set_cursor_visible(false);
-
         let size = window.inner_size();
         if size.width > 0 && size.height > 0 {
             self.camera.aspect = size.width as f32 / size.height as f32;
@@ -745,14 +888,24 @@ impl ApplicationHandler for App {
 
         self.rebuild_world_mesh();
         self.upload_combined_mesh();
-        self.rebuild_ui();
+        // Cursor starts free/visible — the main menu needs it clickable.
+        // `set_cursor_lock(true)` (mouse-look grab) only happens once the
+        // player actually picks a menu option and enters `AppState::InGame`.
+        // Also calls `rebuild_ui` for us, which now shows the menu since
+        // `state` is still `MainMenu` at this point.
+        self.set_cursor_lock(false);
         self.mesh_upload_accum = 0.0;
         self.last_frame = Some(Instant::now());
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.state == AppState::InGame {
+                    self.save_current_world();
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(size.width, size.height);
@@ -764,6 +917,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
+                if self.state == AppState::MainMenu {
+                    // Menu input is mouse-only; keyboard has nothing to do
+                    // (in particular Escape/E must not touch cursor lock —
+                    // the menu needs the free cursor to be clickable).
+                    return;
+                }
                 if code == KeyCode::Escape && event.state == ElementState::Pressed {
                     if self.inventory_open {
                         self.set_inventory_open(false);
@@ -813,7 +972,11 @@ impl ApplicationHandler for App {
                 self.input.cursor_pos = (position.x, position.y);
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
-                if self.inventory_open {
+                if self.state == AppState::MainMenu {
+                    if button == MouseButton::Left {
+                        self.handle_menu_click();
+                    }
+                } else if self.inventory_open {
                     if button == MouseButton::Left {
                         self.pick_inventory_item_at_cursor();
                     }
