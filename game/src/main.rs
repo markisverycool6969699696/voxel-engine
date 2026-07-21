@@ -7,7 +7,7 @@
 //! with biomes, water, caves, ore, and trees. The player and mobs are placed
 //! on the generated surface at startup.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -180,13 +180,19 @@ struct App {
     selected_block: BlockId,
     /// `None` if no audio output device is available — sound is a nice-to-have.
     audio: Option<Audio>,
-    /// Cached triangulated world (chunks only, no mobs) — rebuilt only when
-    /// the world actually changes (chunk load/edit), not every frame.
-    /// `Renderer::set_mesh` does a full `device_wait_idle` + buffer
-    /// recreate per call (see render-vk), so re-triangulating hundreds of
-    /// real terrain sections and re-uploading every rendered frame (as an
-    /// earlier version of this file did, before real terrain existed) stalls
-    /// the GPU pipeline solid — that was the entire "4fps" regression.
+    /// Per-section triangulated mesh cache, keyed by `(cx, sy, cz)`, world-
+    /// offset already baked into the stored positions. Memoized so editing
+    /// one block only re-triangulates *that* section instead of every loaded
+    /// section — re-meshing the whole streamed world (hundreds of sections)
+    /// on every single block break/place was the reported edit-freeze.
+    /// Entries for sections no longer loaded are pruned in `rebuild_world_mesh`.
+    section_meshes: HashMap<(i32, i32, i32), (Vec<MeshVertex>, Vec<u32>)>,
+    /// Sections needing a cache refresh on the next `rebuild_world_mesh` —
+    /// edits mark just the one affected section; newly streamed-in sections
+    /// are picked up automatically (absent from the cache counts as dirty).
+    dirty_sections: HashSet<(i32, i32, i32)>,
+    /// Concatenation of every cached section (chunks only, no mobs) —
+    /// rebuilt from `section_meshes` only when something in it changed.
     world_vertices: Vec<MeshVertex>,
     world_indices: Vec<u32>,
     world_mesh_dirty: bool,
@@ -243,6 +249,8 @@ impl Default for App {
             last_frame: None,
             selected_block,
             audio: Audio::new(),
+            section_meshes: HashMap::new(),
+            dirty_sections: HashSet::new(),
             world_vertices: Vec::new(),
             world_indices: Vec::new(),
             world_mesh_dirty: true,
@@ -259,34 +267,45 @@ impl Default for App {
 const MESH_UPLOAD_INTERVAL: f32 = 1.0 / 12.0;
 
 impl App {
-    /// Re-triangulates every loaded chunk section into `self.world_vertices`/
-    /// `world_indices`. Expensive (greedy-meshes every loaded section) — call
-    /// only when the world actually changed (new sections streamed in, or an
-    /// edit), never per-frame.
+    /// Re-triangulates only sections that need it (missing from the cache —
+    /// i.e. newly streamed in — or explicitly marked dirty by an edit), then
+    /// reassembles `self.world_vertices`/`world_indices` by concatenating the
+    /// full per-section cache. The reassembly concatenation is a plain copy
+    /// over however many sections are currently loaded — cheap relative to
+    /// greedy-meshing, which is the part this cache actually avoids repeating.
     fn rebuild_world_mesh(&mut self) {
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+        let mut still_loaded = HashSet::with_capacity(self.section_meshes.len());
         for ((cx, cz), column) in self.chunks.columns() {
             for (sy, section) in column.loaded_sections() {
-                let quads = greedy_mesh(section, |b| b != AIR);
-                if quads.is_empty() {
-                    continue;
+                let key = (cx, sy, cz);
+                still_loaded.insert(key);
+                if self.section_meshes.contains_key(&key) && !self.dirty_sections.contains(&key) {
+                    continue; // cached and unchanged
                 }
-                let (mut section_vertices, section_indices) = triangulate(&quads);
+                let quads = greedy_mesh(section, |b| b != AIR);
+                let (mut vertices, indices) = triangulate(&quads);
                 let offset = Vec3::new(
                     (cx * SECTION_DIM) as f32,
                     (sy * SECTION_DIM) as f32,
                     (cz * SECTION_DIM) as f32,
                 );
-                for v in &mut section_vertices {
+                for v in &mut vertices {
                     v.position[0] += offset.x;
                     v.position[1] += offset.y;
                     v.position[2] += offset.z;
                 }
-                let base = vertices.len() as u32;
-                indices.extend(section_indices.into_iter().map(|i| i + base));
-                vertices.extend(section_vertices);
+                self.section_meshes.insert(key, (vertices, indices));
             }
+        }
+        self.dirty_sections.clear();
+        self.section_meshes.retain(|k, _| still_loaded.contains(k));
+
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (v, i) in self.section_meshes.values() {
+            let base = vertices.len() as u32;
+            indices.extend(i.iter().map(|idx| idx + base));
+            vertices.extend(v.iter().copied());
         }
         self.world_vertices = vertices;
         self.world_indices = indices;
@@ -493,6 +512,13 @@ impl App {
             (world.x.rem_euclid(SECTION_DIM) as usize, world.z.rem_euclid(SECTION_DIM) as usize);
         let edited = self.chunks.set_block(cx, cz, lx, world.y, lz, block);
         if edited {
+            // Each section's mesh only depends on its own content (greedy_mesh
+            // never looks across section boundaries — a solid block at a
+            // section's own top/bottom slice is always treated as exposed
+            // there regardless of the neighbor), so only this one section
+            // needs re-meshing, not the whole world.
+            let sy = world.y.div_euclid(SECTION_DIM);
+            self.dirty_sections.insert((cx, sy, cz));
             self.world_mesh_dirty = true;
         }
         edited

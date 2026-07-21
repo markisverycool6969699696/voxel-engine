@@ -16,14 +16,17 @@
 //! via a descriptor set. Added a depth buffer (recreated alongside the
 //! swapchain) with standard less-than depth testing.
 //!
-//! Back-face culling (`FrontFace::CLOCKWISE` + `CullModeFlags::BACK`) is now
-//! enabled. The winding math it depends on (CCW-from-outside-wound quads
-//! through our Y-flipped Vulkan projection, see `engine_core::camera` docs)
-//! was reasoned through and the *scene without culling* was user-confirmed
-//! rendering correctly, which is strong evidence the winding direction is
-//! right — but culling being *on* specifically has not itself been visually
-//! re-checked yet (nothing here should ever disappear if it's correct; if
-//! geometry vanishes or looks inside-out, that's this line).
+//! Back-face culling (`FrontFace::COUNTER_CLOCKWISE` + `CullModeFlags::BACK`)
+//! is enabled. `CLOCKWISE` was the original guess and shipped un-reconfirmed
+//! for a while (see this file's git history / MEMORY.md) — it was backwards:
+//! it culled the near/outer faces and left only the far/inner ones, which
+//! read as the world rendering inside-out ("upside down") once real terrain
+//! (sky above, caves below) made the orientation unambiguous. `mesh.rs`'s
+//! quads are CCW-from-outside in world space; the Y-flip in
+//! `engine_core::camera`'s projection (see its docs) mirrors that to
+//! CW-from-outside once rasterized, so `COUNTER_CLOCKWISE` here is what
+//! actually keeps the outer/near faces as front-facing. If geometry vanishes
+//! or looks inside-out again, this is the first line to check.
 //!
 //! Sync design (the part that must be right):
 //! - `FRAMES_IN_FLIGHT = 2` frames, each with its own command buffer,
@@ -698,11 +701,23 @@ impl VkRenderer {
                 .scissor_count(1);
 
             // See module docs: culling direction depends on the Y-flip in
-            // engine_core::camera's projection matrix.
+            // engine_core::camera's projection matrix. `VULKAN_CLIP_CORRECTION`
+            // negates clip-space Y to make world-up display as screen-up (see
+            // camera.rs, tested); as an unavoidable side effect that also
+            // mirrors the apparent winding of every triangle as rasterized
+            // (a single-axis flip inverts chirality). mesh.rs's quads are
+            // wound CCW-from-outside in world space; after the Y-flip they
+            // rasterize CW-from-outside, so the front face Vulkan should keep
+            // is COUNTER_CLOCKWISE here (i.e. the opposite of what a
+            // no-Y-flip pipeline would use). Previously CLOCKWISE — chosen
+            // without ever independently re-confirming culling correctness
+            // by eye (see MEMORY.md), which was exactly backwards: it culled
+            // the near/outer faces and left only the far/inner ones visible,
+            // reading as the world rendered inside-out ("upside down").
             let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
                 .cull_mode(vk::CullModeFlags::BACK)
-                .front_face(vk::FrontFace::CLOCKWISE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
                 .line_width(1.0);
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);

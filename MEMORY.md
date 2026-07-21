@@ -374,6 +374,39 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
     **Not yet re-confirmed by the user** — this is exactly the kind of thing only they can verify
     (frame-rate feel and "does it still look flipped" are not testable from here).
 
+- **BUG + FIX (2026-07-21): the "upside down" report was real — backwards back-face culling, latent
+  since it was first enabled.** User confirmed fps was better after the mesh-throttle fix but
+  still reported the world upside down, ruling out the "mouse-lurch from stalls" theory (the perf
+  fix alone should have made that far rarer, yet the report was unchanged). Re-derived the actual
+  bug from first principles: `render-vk`'s `VULKAN_CLIP_CORRECTION` negates clip-space Y (required
+  and tested — it's what makes world-up display as screen-up on Vulkan's natively Y-down NDC), but
+  a single-axis flip is a mirror, so it *necessarily* also inverts the apparent winding order of
+  every triangle as rasterized. `mesh.rs`'s quads are wound CCW-from-outside in world space;
+  post-flip they rasterize CW-from-outside — so the pipeline's `front_face` needs to be
+  `COUNTER_CLOCKWISE` to keep the *near/outer* faces front-facing (and thus visible after
+  `CullModeFlags::BACK` discards the rest). It was set to `CLOCKWISE` — backwards — which culled
+  the near/outer faces and left only the far/inner ones rendering: for a heightmap with open sky
+  above and hollow underground below, that reads exactly as "the world is inside-out/upside down."
+  This was flagged as a real risk from the start (see the original culling-enable checkpoint:
+  "enabled only after user visually confirmed the *unculled* scene rendered correctly" — the
+  culled result itself was never re-checked) and simply never surfaced with the small demo
+  platform, where side-facing box geometry didn't make the direction obviously wrong. Fixed:
+  `render-vk/src/lib.rs`'s rasterization state, `FrontFace::CLOCKWISE` → `COUNTER_CLOCKWISE` (one
+  line + updated doc comments explaining the Y-flip/winding relationship precisely, so this
+  doesn't get re-guessed wrong again). **Also fixed the reported ~0.5s freeze on breaking a
+  block**: edits were still calling the same full-world `rebuild_world_mesh` (all loaded sections
+  re-greedy-meshed) the perf fix left in place for *any* world change, not just streaming — so one
+  block edit paid the same cost as a full chunk-radius load. Added a per-section mesh cache
+  (`section_meshes: HashMap<(cx,sy,cz), (Vec<MeshVertex>, Vec<u32>)>`, world-offset baked in);
+  `rebuild_world_mesh` now only re-greedy-meshes sections that are missing from the cache (newly
+  streamed) or explicitly marked dirty (`dirty_sections`, set by `set_world_block` for just the
+  one edited section — verified safe because `greedy_mesh` never looks across section boundaries,
+  so a section's mesh depends only on its own content), then reassembles the world buffer by
+  concatenating the cache (a plain copy, not a re-mesh). Verified: `cargo test --workspace` 81/81,
+  clean build (no warnings), 15s soak clean, no leftover process. **Both fixes await the user's
+  visual confirmation** — a GPU cull-mode setting and a perceived edit-freeze are not things unit
+  tests or a soak-run can verify; only looking at the running game can.
+
 ## Next Up
 **Both Opus-tier milestones are done** (terrain generation + biome blending, and pathfinding
 around partially-loaded chunks). The remaining Opus §6 item, "reviewing/hardening the foundation,"

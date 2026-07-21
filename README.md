@@ -106,8 +106,10 @@ game/          binary crate tying engine-core + render-vk together (+ data/ bloc
   behavior tag exists in the registry for it) is future work.
 - Sound is synthesized placeholder tones (no real sound assets — see the open decision in
   `docs/STARTER.md` §8), not a bug, just not "real" content yet.
-- Back-face culling is enabled but hasn't been independently re-confirmed by eye since being
-  turned on (it *should* be a no-op visually if correct).
+- ~~Back-face culling not independently re-confirmed by eye~~ — it was actually backwards
+  (`FrontFace` was set to the wrong winding, culling the near faces instead of the far ones,
+  which read as the world rendering inside-out once real terrain made orientation unambiguous).
+  Fixed; see MEMORY.md for the full writeup.
 
 ## License
 
