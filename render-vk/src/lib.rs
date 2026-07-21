@@ -92,20 +92,46 @@ struct GlobalsUbo {
 }
 
 /// Procedurally generates a single-row atlas: `ATLAS_TILE_COUNT` tiles of
-/// `ATLAS_TILE_SIZE`² pixels, each a hashed base color with a coarse 4x4
-/// checker so it reads as "textured" rather than a flat swatch — same
-/// "hash the id" idea the pre-atlas debug coloring used, just baked into
-/// pixels instead of a per-vertex color.
+/// Base (undarkened) color for atlas tile `tile`. `engine_core::mesh::
+/// tile_for_block` maps a block id to `id % ATLAS_TILE_COUNT`, which is the
+/// identity for every id below 16 — every block this project currently
+/// defines (see `game/data/blocks.json`) — so tile index and block id
+/// coincide today. Known blocks get a hand-picked, semantically obvious
+/// color instead of a hash: a fully arbitrary hash color made it impossible
+/// to tell "is this water, a hole, or solid ground" at a glance (a real
+/// session report — water hashed to a khaki/tan that read as a flat gray
+/// pit against grass, see MEMORY.md). Unknown tile indices (room for future
+/// block ids up to 15) still fall back to the original hash, so new content
+/// gets *some* distinct color for free without a code change here.
+fn tile_base_color(tile: u32) -> [u8; 3] {
+    match tile {
+        0 => [235, 235, 235],  // air: never actually rendered, kept for completeness
+        1 => [130, 130, 130],  // stone: neutral gray
+        2 => [121, 85, 58],    // dirt: brown
+        3 => [86, 156, 66],    // grass: green
+        4 => [219, 202, 138],  // sand: tan
+        5 => [64, 128, 200],   // water: blue — the specific block this fix is for
+        6 => [117, 84, 51],    // wood: darker brown
+        7 => [58, 122, 48],    // leaves: darker green, distinct from grass
+        8 => [235, 235, 240],  // snow: near-white
+        9 => [40, 40, 40],     // bedrock: near-black
+        10 => [70, 70, 70],    // coal ore: dark gray
+        11 => [176, 148, 120], // iron ore: rusty tan
+        12 => [200, 40, 40],   // mob marker: red (a debug marker, not real terrain)
+        _ => {
+            let h = tile.wrapping_mul(2654435761);
+            [80 + (h & 0x7F) as u8, 80 + ((h >> 8) & 0x7F) as u8, 80 + ((h >> 16) & 0x7F) as u8]
+        }
+    }
+}
+
+/// `ATLAS_TILE_SIZE`² pixels per tile, each `tile_base_color` with a coarse
+/// 4x4 checker so it reads as "textured" rather than a flat swatch.
 fn generate_atlas_pixels() -> Vec<u8> {
     let (width, height) = (ATLAS_TILE_COUNT * ATLAS_TILE_SIZE, ATLAS_TILE_SIZE);
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for tile in 0..ATLAS_TILE_COUNT {
-        let h = tile.wrapping_mul(2654435761);
-        let base = [
-            80 + (h & 0x7F) as u8,
-            80 + ((h >> 8) & 0x7F) as u8,
-            80 + ((h >> 16) & 0x7F) as u8,
-        ];
+        let base = tile_base_color(tile);
         for y in 0..ATLAS_TILE_SIZE {
             for x in 0..ATLAS_TILE_SIZE {
                 let darker = ((x / 4) + (y / 4)) % 2 == 0;

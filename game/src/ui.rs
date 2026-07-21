@@ -62,19 +62,38 @@ pub fn crosshair(aspect: f32) -> (Vec<UiVertex>, Vec<u32>) {
     (vertices, indices)
 }
 
-/// Deterministic placeholder color per block id — same "hash the id" idea
-/// `engine_core::mesh`'s atlas tile hashing uses, just producing an RGB
-/// swatch directly instead of a tile index (no texture sampling in the UI
-/// pipeline). Not meant to match the in-world atlas tile exactly, just to be
-/// a stable, distinct color per block for picking it out in the inventory.
+/// Deterministic placeholder color per block id — mirrors `render-vk`'s
+/// `tile_base_color` (semantic hand-picked colors for known blocks, e.g.
+/// water is blue, not an arbitrary hash) so a swatch in the inventory
+/// actually matches what that block looks like in the world. A fully
+/// arbitrary hash was confusing in-world (see MEMORY.md — water hashed to a
+/// gray/tan that read as a hole), and would be just as confusing here for
+/// the same reason, so unknown ids beyond the known set still fall back to
+/// a hash rather than reintroducing that problem for future block ids.
 pub fn color_for_block(id: u16) -> [f32; 4] {
-    let h = (id as u32).wrapping_mul(2654435761);
-    let r = ((h >> 16) & 0xFF) as f32 / 255.0;
-    let g = ((h >> 8) & 0xFF) as f32 / 255.0;
-    let b = (h & 0xFF) as f32 / 255.0;
-    // Floor each channel so no swatch is too close to black (hard to see
-    // against the menu background) or the white grid-cell border.
-    [0.25 + r * 0.75, 0.25 + g * 0.75, 0.25 + b * 0.75, 1.0]
+    let rgb: [u8; 3] = match id {
+        0 => [235, 235, 235],
+        1 => [130, 130, 130],
+        2 => [121, 85, 58],
+        3 => [86, 156, 66],
+        4 => [219, 202, 138],
+        5 => [64, 128, 200],
+        6 => [117, 84, 51],
+        7 => [58, 122, 48],
+        8 => [235, 235, 240],
+        9 => [40, 40, 40],
+        10 => [70, 70, 70],
+        11 => [176, 148, 120],
+        12 => [200, 40, 40],
+        _ => {
+            let h = (id as u32).wrapping_mul(2654435761);
+            // Floored so no fallback swatch is too close to black (hard to
+            // see against the menu background) or the white grid-cell border.
+            let floor = |shift: u32| (0.25 + ((h >> shift) & 0xFF) as f32 / 255.0 * 0.75) * 255.0;
+            [floor(16) as u8, floor(8) as u8, floor(0) as u8]
+        }
+    };
+    [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0, 1.0]
 }
 
 pub const INV_COLS: usize = 5;
