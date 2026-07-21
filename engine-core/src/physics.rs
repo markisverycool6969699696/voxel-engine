@@ -24,6 +24,7 @@ const GRAVITY: f32 = -20.0;
 const JUMP_SPEED: f32 = 7.0;
 const MAX_FALL_SPEED: f32 = -40.0;
 const WALK_SPEED: f32 = 4.5;
+const FLY_SPEED: f32 = 8.0;
 
 fn voxel_range(min: f32, max: f32) -> std::ops::RangeInclusive<i32> {
     const EPS: f32 = 1e-4;
@@ -84,21 +85,36 @@ pub struct PlayerController {
     pub position: Vec3,
     pub velocity: Vec3,
     pub on_ground: bool,
+    /// Creative-mode flight: gravity off, vertical speed under direct
+    /// control via `wish_dir.y`. Collision stays on (this is flight, not
+    /// noclip) — still resolved through the same `move_and_collide` sweep.
+    pub flying: bool,
 }
 
 impl PlayerController {
     pub fn new(position: Vec3) -> Self {
-        Self { position, velocity: Vec3::ZERO, on_ground: false }
+        Self { position, velocity: Vec3::ZERO, on_ground: false, flying: false }
     }
 
     pub fn eye_position(&self) -> Vec3 {
         self.position + Vec3::new(0.0, EYE_HEIGHT_OFFSET, 0.0)
     }
 
-    /// `wish_dir` is a horizontal (y ignored), caller-normalized direction —
-    /// zero vector for "no horizontal input". No acceleration/friction
-    /// modeling yet (velocity snaps directly to wish speed); that's a feel
-    /// tweak for later, not a correctness concern.
+    /// Toggles flight, clearing fall/jump state either way so leaving flight
+    /// resumes under gravity cleanly rather than keeping stale y-velocity.
+    pub fn toggle_flying(&mut self) {
+        self.flying = !self.flying;
+        self.velocity.y = 0.0;
+        self.on_ground = false;
+    }
+
+    /// `wish_dir.x`/`.z` are a horizontal (caller-normalized) direction —
+    /// zero for "no horizontal input". `wish_dir.y` is ignored unless
+    /// `flying` is set, in which case it directly drives vertical speed
+    /// (expected range roughly -1..=1: descend/hold/ascend), independent of
+    /// the horizontal normalization. No acceleration/friction modeling yet
+    /// (velocity snaps directly to wish speed); that's a feel tweak for
+    /// later, not a correctness concern.
     pub fn update(
         &mut self,
         dt: f32,
@@ -109,16 +125,24 @@ impl PlayerController {
         self.velocity.x = wish_dir.x * WALK_SPEED;
         self.velocity.z = wish_dir.z * WALK_SPEED;
 
-        if self.on_ground && jump {
-            self.velocity.y = JUMP_SPEED;
+        if self.flying {
+            self.velocity.y = wish_dir.y * FLY_SPEED;
+        } else {
+            if self.on_ground && jump {
+                self.velocity.y = JUMP_SPEED;
+            }
+            self.velocity.y = (self.velocity.y + GRAVITY * dt).max(MAX_FALL_SPEED);
         }
-        self.velocity.y = (self.velocity.y + GRAVITY * dt).max(MAX_FALL_SPEED);
 
         let half = Vec3::new(PLAYER_HALF_WIDTH, PLAYER_HALF_HEIGHT, PLAYER_HALF_WIDTH);
         let (new_pos, collided) = move_and_collide(self.position, half, self.velocity * dt, is_solid);
         self.position = new_pos;
 
-        if collided[1] {
+        if self.flying {
+            // Flight overrides grounded state entirely — landing is only a
+            // "not flying" concept.
+            self.on_ground = false;
+        } else if collided[1] {
             // Sign checked before the zero-out below: only a downward block
             // counts as landing, not bonking your head on a ceiling.
             self.on_ground = self.velocity.y <= 0.0;
@@ -206,6 +230,56 @@ mod tests {
         }
         assert!(p.on_ground);
         assert!(p.position.y > 0.0, "tunneled through the floor: y={}", p.position.y);
+    }
+
+    #[test]
+    fn flying_ignores_gravity_and_climbs_on_positive_y_wish() {
+        let mut p = PlayerController::new(Vec3::new(0.0, 10.0, 0.0));
+        p.toggle_flying();
+        let no_ground = |_, _, _| false;
+        for _ in 0..30 {
+            p.update(1.0 / 60.0, Vec3::new(0.0, 1.0, 0.0), false, no_ground);
+        }
+        assert!(p.position.y > 10.0, "expected to climb while flying: y={}", p.position.y);
+        assert!(!p.on_ground);
+    }
+
+    #[test]
+    fn flying_holds_altitude_with_zero_vertical_wish() {
+        let mut p = PlayerController::new(Vec3::new(0.0, 10.0, 0.0));
+        p.toggle_flying();
+        let no_ground = |_, _, _| false;
+        for _ in 0..60 {
+            p.update(1.0 / 60.0, Vec3::ZERO, false, no_ground);
+        }
+        // No gravity applied: y should not have dropped like the falling test does.
+        assert!((p.position.y - 10.0).abs() < 1e-3, "expected no fall while flying: y={}", p.position.y);
+    }
+
+    #[test]
+    fn leaving_flight_resumes_falling_under_gravity() {
+        let mut p = PlayerController::new(Vec3::new(0.0, 10.0, 0.0));
+        p.toggle_flying();
+        let no_ground = |_, _, _| false;
+        p.update(1.0 / 60.0, Vec3::ZERO, false, no_ground);
+        p.toggle_flying(); // back to normal physics
+        assert!(!p.flying);
+        assert_eq!(p.velocity.y, 0.0); // toggle clears stale velocity
+        p.update(1.0 / 60.0, Vec3::ZERO, false, no_ground);
+        assert!(p.velocity.y < 0.0, "expected gravity to resume");
+    }
+
+    #[test]
+    fn flight_still_collides_with_solids() {
+        // Solid ceiling at y == 15 (block occupies [15,16)); flying straight
+        // up should stop just below it, not clip through.
+        let ceiling = |_: i32, y: i32, _: i32| y == 15;
+        let mut p = PlayerController::new(Vec3::new(0.0, 10.0, 0.0));
+        p.toggle_flying();
+        for _ in 0..300 {
+            p.update(1.0 / 60.0, Vec3::new(0.0, 1.0, 0.0), false, &ceiling);
+        }
+        assert!(p.position.y + PLAYER_HALF_HEIGHT <= 15.0 + 1e-3, "clipped into ceiling: y={}", p.position.y);
     }
 
     #[test]

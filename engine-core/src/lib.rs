@@ -4,6 +4,7 @@
 pub mod camera;
 pub mod chunk;
 pub mod mesh;
+pub mod mob;
 pub mod physics;
 pub mod raycast;
 pub mod registry;
