@@ -1,0 +1,7 @@
+[
+  { "id": 0, "key": "air", "hardness": 0.0, "solid": false },
+  { "id": 1, "key": "debug_stone", "hardness": 1.5, "solid": true },
+  { "id": 2, "key": "debug_dirt", "hardness": 0.5, "solid": true },
+  { "id": 3, "key": "debug_block_3", "hardness": 1.0, "solid": true },
+  { "id": 4, "key": "debug_block_4", "hardness": 1.0, "solid": true }
+]

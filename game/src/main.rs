@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 
 use engine_core::camera::Camera;
 use engine_core::chunk::{BlockId, PalettedSection, AIR};
-use engine_core::mesh::{greedy_mesh, triangulate};
+use engine_core::mesh::{greedy_mesh, triangulate, MeshVertex};
+use engine_core::mob::Mob;
 use engine_core::physics::PlayerController;
 use engine_core::raycast::raycast_voxels;
+use engine_core::registry::{BlockDef, ItemDef, Registry};
 use engine_core::streaming::{ChunkGenerator, ChunkManager, StreamingConfig};
 use engine_core::Renderer;
 use glam::Vec3;
@@ -49,9 +51,49 @@ const STREAMING: StreamingConfig = StreamingConfig {
     workers: 2,
 };
 
-/// Placeholder hotbar (number keys 1-4) until there's a real inventory —
-/// same debug-colored block ids used everywhere else, no new content.
-const HOTBAR: [BlockId; 4] = [BlockId(1), BlockId(2), BlockId(3), BlockId(4)];
+/// Hotbar (number keys 1-4): item ids resolved through the data-driven
+/// `Registry<ItemDef>`/`Registry<BlockDef>` (see `data/items.json`,
+/// `data/blocks.json`) instead of a raw block-id array. Still the same 4
+/// debug-colored placeholder blocks as before — this wires the existing
+/// registry module into actual use, it doesn't invent new content (the
+/// "final v1 block/item list" is explicitly an open decision per
+/// docs/STARTER.md §8, not made here).
+const HOTBAR_ITEM_IDS: [u16; 4] = [1, 2, 3, 4];
+
+/// Resolves a hotbar item id to the `BlockId` it places. Panics on a bad
+/// registry/hotbar mismatch — that's a data bug in the shipped JSON, not a
+/// runtime condition to recover from.
+fn block_for_item(items: &Registry<ItemDef>, blocks: &Registry<BlockDef>, item_id: u16) -> BlockId {
+    let item = items.get_by_id(item_id).expect("hotbar item id must exist in items.json");
+    let block_key = item.places_block.as_deref().expect("hotbar item must place a block");
+    let block = blocks.get(block_key).expect("places_block key must exist in blocks.json");
+    BlockId(block.id)
+}
+
+/// Placeholder mob appearance/size — not a real mob roster, just enough to
+/// prove wandering AI + collision + rendering work end to end.
+const MOB_BLOCK: BlockId = BlockId(5);
+const MOB_SIZE: Vec3 = Vec3::new(0.6, 0.8, 0.6);
+const MOB_WALK_SPEED: f32 = 1.5;
+
+/// Builds a small axis-aligned box mesh for a mob by reusing `greedy_mesh`'s
+/// already-tested winding/tiling logic on a synthetic single-cell section,
+/// then scaling the resulting unit cube to `size` and translating to
+/// `center`. A solid placeholder box, same idea as using debug block ids for
+/// the hand-built demo structure — not a real mob model.
+fn mob_box_mesh(center: Vec3, size: Vec3, block: BlockId) -> (Vec<MeshVertex>, Vec<u32>) {
+    let mut s = PalettedSection::filled(AIR);
+    s.set(0, 0, 0, block);
+    let quads = greedy_mesh(&s, |b| b != AIR);
+    let (mut vertices, indices) = triangulate(&quads);
+    let origin = center - size / 2.0;
+    for v in &mut vertices {
+        v.position[0] = v.position[0] * size.x + origin.x;
+        v.position[1] = v.position[1] * size.y + origin.y;
+        v.position[2] = v.position[2] * size.z + origin.z;
+    }
+    (vertices, indices)
+}
 
 fn is_solid_in(chunks: &ChunkManager, x: i32, y: i32, z: i32) -> bool {
     let (cx, cz) = (x.div_euclid(SECTION_DIM), z.div_euclid(SECTION_DIM));
@@ -130,6 +172,9 @@ struct App {
     player: PlayerController,
     chunks: ChunkManager,
     streaming_center: Option<(i32, i32)>,
+    mobs: Vec<Mob>,
+    blocks: Registry<BlockDef>,
+    items: Registry<ItemDef>,
     input: Input,
     last_frame: Option<Instant>,
     selected_block: BlockId,
@@ -150,6 +195,22 @@ impl Default for App {
         let mut camera = Camera::new(player.eye_position(), 1.0);
         camera.yaw = 2.0; // facing roughly toward the staircase from this corner
         camera.pitch = -0.1;
+
+        let blocks = Registry::<BlockDef>::load_from_str(include_str!("../data/blocks.json"))
+            .expect("data/blocks.json must parse");
+        let items = Registry::<ItemDef>::load_from_str(include_str!("../data/items.json"))
+            .expect("data/items.json must parse");
+        let selected_block = block_for_item(&items, &blocks, HOTBAR_ITEM_IDS[0]);
+
+        // Two fixed spawn points on the demo platform's flat top surface
+        // (y=1, away from the border wall and center staircase) — not a
+        // spawning system, just enough to see wander AI working.
+        let mob_y = 1.0 + MOB_SIZE.y / 2.0 + 0.05;
+        let mobs = vec![
+            Mob::new(Vec3::new(12.5, mob_y, 2.5), MOB_SIZE / 2.0, 1001),
+            Mob::new(Vec3::new(2.5, mob_y, 12.5), MOB_SIZE / 2.0, 2002),
+        ];
+
         Self {
             window: None,
             renderer: None,
@@ -157,20 +218,25 @@ impl Default for App {
             player,
             chunks: ChunkManager::new(Arc::new(DemoGenerator), STREAMING),
             streaming_center: None,
+            mobs,
+            blocks,
+            items,
             input: Input::default(),
             last_frame: None,
-            selected_block: HOTBAR[0],
+            selected_block,
             audio: Audio::new(),
         }
     }
 }
 
 impl App {
-    /// Merges every loaded chunk's mesh into one combined buffer and uploads
-    /// it. `Renderer::set_mesh` only holds one mesh at a time, so a per-chunk
-    /// GPU resource split is future work if the streamed world grows enough
-    /// to make full-world rebuilds too slow — fine for the current small
-    /// radius.
+    /// Merges every loaded chunk's mesh plus every mob's box into one
+    /// combined buffer and uploads it. `Renderer::set_mesh` only holds one
+    /// mesh at a time, so a per-chunk/per-entity GPU resource split is
+    /// future work if the streamed world (or mob count) grows enough to
+    /// make full rebuilds too slow — fine for the current small scale, and
+    /// mobs move every frame regardless, so this already has to run every
+    /// frame rather than only on world change.
     fn rebuild_mesh(&mut self) {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let mut vertices = Vec::new();
@@ -197,21 +263,33 @@ impl App {
                 vertices.extend(section_vertices);
             }
         }
+        for mob in &self.mobs {
+            let (mob_vertices, mob_indices) = mob_box_mesh(mob.position, MOB_SIZE, MOB_BLOCK);
+            let base = vertices.len() as u32;
+            indices.extend(mob_indices.into_iter().map(|i| i + base));
+            vertices.extend(mob_vertices);
+        }
         if let Err(e) = renderer.set_mesh(&vertices, &indices) {
             eprintln!("mesh upload error: {e:#}");
         }
     }
 
     /// Moves the streaming radius to follow the player and integrates any
-    /// finished background generation. Returns true if the mesh needs
-    /// rebuilding (new sections landed).
-    fn update_streaming(&mut self) -> bool {
+    /// finished background generation.
+    fn update_streaming(&mut self) {
         let center = world_chunk_of(self.player.position);
         if self.streaming_center != Some(center) {
             self.streaming_center = Some(center);
             self.chunks.set_center(center.0, center.1);
         }
-        self.chunks.pump() > 0
+        self.chunks.pump();
+    }
+
+    fn update_mobs(&mut self, dt: f32) {
+        let chunks = &self.chunks;
+        for mob in &mut self.mobs {
+            mob.update(dt, MOB_WALK_SPEED, |x, y, z| is_solid_in(chunks, x, y, z));
+        }
     }
 
     fn update_and_render(&mut self) {
@@ -251,23 +329,32 @@ impl App {
                 wish *= SPRINT_MULTIPLIER;
             }
         }
-        let jump = self.held(KeyCode::Space);
+        // Vertical control only means something while flying (creative
+        // mode); Space otherwise means jump, handled below instead.
+        if self.player.flying {
+            if self.held(KeyCode::Space) {
+                wish.y += 1.0;
+            }
+            if self.held(KeyCode::ControlLeft) {
+                wish.y -= 1.0;
+            }
+        }
+        let jump = !self.player.flying && self.held(KeyCode::Space);
 
         let chunks = &self.chunks;
         self.player.update(dt, wish, jump, |x, y, z| is_solid_in(chunks, x, y, z));
         self.camera.position = self.player.eye_position();
 
-        let mut needs_remesh = self.update_streaming();
+        self.update_streaming();
+        self.update_mobs(dt);
 
         if self.input.mine_requested || self.input.place_requested {
-            needs_remesh |= self.handle_interaction();
+            self.handle_interaction();
         }
         self.input.mine_requested = false;
         self.input.place_requested = false;
 
-        if needs_remesh {
-            self.rebuild_mesh();
-        }
+        self.rebuild_mesh();
 
         if let Some(renderer) = self.renderer.as_mut() {
             if let Err(e) = renderer.render_frame(&self.camera) {
@@ -279,18 +366,15 @@ impl App {
         }
     }
 
-    /// Returns true if a block was actually changed (mesh needs rebuilding).
-    fn handle_interaction(&mut self) -> bool {
+    fn handle_interaction(&mut self) {
         let chunks = &self.chunks;
         let hit = raycast_voxels(self.camera.position, self.camera.forward(), MAX_REACH, |x, y, z| {
             is_solid_in(chunks, x, y, z)
         });
-        let Some(hit) = hit else { return false };
+        let Some(hit) = hit else { return };
 
-        let mut edited = false;
         if self.input.mine_requested {
             if self.set_world_block(hit.block, AIR) {
-                edited = true;
                 if let Some(audio) = &self.audio {
                     audio.play_mine();
                 }
@@ -299,14 +383,15 @@ impl App {
             let target = hit.block + hit.normal;
             let already_solid = is_solid_in(&self.chunks, target.x, target.y, target.z);
             let overlaps_player = aabb_contains_cell(self.player.position, target);
-            if !already_solid && !overlaps_player && self.set_world_block(target, self.selected_block) {
-                edited = true;
+            if !already_solid
+                && !overlaps_player
+                && self.set_world_block(target, self.selected_block)
+            {
                 if let Some(audio) = &self.audio {
                     audio.play_place();
                 }
             }
         }
-        edited
     }
 
     /// World-space edit, routed to the owning chunk. False (no-op) if the
@@ -412,7 +497,11 @@ impl ApplicationHandler for App {
                         _ => None,
                     };
                     if let Some(slot) = slot {
-                        self.selected_block = HOTBAR[slot];
+                        self.selected_block =
+                            block_for_item(&self.items, &self.blocks, HOTBAR_ITEM_IDS[slot]);
+                    }
+                    if code == KeyCode::KeyF {
+                        self.player.toggle_flying();
                     }
                 }
                 match event.state {
