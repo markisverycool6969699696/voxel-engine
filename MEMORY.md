@@ -345,6 +345,35 @@ Updated after each completed task. See [project.md](project.md) for the plan/dec
   - Verified: `cargo test --workspace` 81/81 (was 74; +6 pathfind, +1 mob steering). `game.exe`
     soaked 15s clean on the Intel Arc GPU, no panics/crashes, no leftover process.
 
+- **BUG + FIX (2026-07-21, Sonnet): "flipped upside down" + ~4fps regression from the terrain
+  session.** User-reported after launching with real terrain. Root cause found by reading
+  `render-vk`'s `set_mesh` (its own doc comment: "Fine for upload once at startup; per-frame mesh
+  streaming would need a smarter (non-stalling) replacement strategy" — it does a full
+  `device_wait_idle()` + destroy/recreate of the vertex+index buffers on *every* call). The mob-AI
+  session made `rebuild_mesh()` (re-triangulating **every loaded chunk section**, now hundreds of
+  real terrain sections instead of near-all-uniform-air) unconditional every rendered frame, and
+  left a second, redundant, un-throttled call to it sitting in `update_and_render` even after
+  later refactors — so the game was doing a full GPU-pipeline stall + full-world greedy-mesh
+  recompute up to 60×/sec. That fully explains the ~4fps. The "upside down" report is very likely
+  a secondary symptom, not a separate geometry bug: `camera.rs`'s Vulkan clip-space Y-flip is
+  untouched since it was tested/confirmed working, and pitch is hard-clamped to ±1.5rad so the
+  camera *cannot* genuinely flip past vertical — but with the main thread stalling for large
+  stretches, many buffered `MouseMotion` events could land in one oversized `mouse_delta` and
+  pitch could clamp hard against straight-up or straight-down in one lurch, which reads as
+  "flipped" to a user without the clamp having actually broken. Did **not** touch `camera.rs` —
+  no evidence of an actual bug there, and it's tested/previously visually confirmed.
+  - **Fix** (`game/src/main.rs`): split the old `rebuild_mesh` into `rebuild_world_mesh` (re-
+    triangulates chunks only, into new cached `world_vertices`/`world_indices` fields — called only
+    when `update_streaming` reports new sections landed, or an edit happens via `set_world_block`
+    setting `world_mesh_dirty`) and `upload_combined_mesh` (clones the cached world buffer, appends
+    fresh mob boxes, calls `set_mesh` — throttled to `MESH_UPLOAD_INTERVAL` = 12Hz via an
+    accumulator, so continuous mob motion can't reintroduce a per-frame stall). Deleted the
+    leftover redundant `rebuild_mesh()` call in `update_and_render`.
+  - Verified: `cargo test --workspace` 81/81 unaffected, build clean (no warnings — confirms the
+    old method was actually renamed/removed, not left dead), 15s soak clean, no leftover process.
+    **Not yet re-confirmed by the user** — this is exactly the kind of thing only they can verify
+    (frame-rate feel and "does it still look flipped" are not testable from here).
+
 ## Next Up
 **Both Opus-tier milestones are done** (terrain generation + biome blending, and pathfinding
 around partially-loaded chunks). The remaining Opus §6 item, "reviewing/hardening the foundation,"

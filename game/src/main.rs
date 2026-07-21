@@ -180,6 +180,19 @@ struct App {
     selected_block: BlockId,
     /// `None` if no audio output device is available — sound is a nice-to-have.
     audio: Option<Audio>,
+    /// Cached triangulated world (chunks only, no mobs) — rebuilt only when
+    /// the world actually changes (chunk load/edit), not every frame.
+    /// `Renderer::set_mesh` does a full `device_wait_idle` + buffer
+    /// recreate per call (see render-vk), so re-triangulating hundreds of
+    /// real terrain sections and re-uploading every rendered frame (as an
+    /// earlier version of this file did, before real terrain existed) stalls
+    /// the GPU pipeline solid — that was the entire "4fps" regression.
+    world_vertices: Vec<MeshVertex>,
+    world_indices: Vec<u32>,
+    world_mesh_dirty: bool,
+    /// Throttles combined (world+mobs) GPU uploads so continuous mob motion
+    /// doesn't pay `set_mesh`'s stall every frame either.
+    mesh_upload_accum: f32,
 }
 
 impl Default for App {
@@ -230,20 +243,27 @@ impl Default for App {
             last_frame: None,
             selected_block,
             audio: Audio::new(),
+            world_vertices: Vec::new(),
+            world_indices: Vec::new(),
+            world_mesh_dirty: true,
+            mesh_upload_accum: 0.0,
         }
     }
 }
 
+/// Combined (world+mobs) GPU upload rate cap. `set_mesh` stalls the whole
+/// device (`device_wait_idle` + buffer recreate per render-vk's own docs),
+/// so this is a hard ceiling on how often mob motion alone can trigger an
+/// upload — 12Hz is smooth enough for slow-wandering placeholder boxes and
+/// keeps that stall off the hot path.
+const MESH_UPLOAD_INTERVAL: f32 = 1.0 / 12.0;
+
 impl App {
-    /// Merges every loaded chunk's mesh plus every mob's box into one
-    /// combined buffer and uploads it. `Renderer::set_mesh` only holds one
-    /// mesh at a time, so a per-chunk/per-entity GPU resource split is
-    /// future work if the streamed world (or mob count) grows enough to
-    /// make full rebuilds too slow — fine for the current small scale, and
-    /// mobs move every frame regardless, so this already has to run every
-    /// frame rather than only on world change.
-    fn rebuild_mesh(&mut self) {
-        let Some(renderer) = self.renderer.as_mut() else { return };
+    /// Re-triangulates every loaded chunk section into `self.world_vertices`/
+    /// `world_indices`. Expensive (greedy-meshes every loaded section) — call
+    /// only when the world actually changed (new sections streamed in, or an
+    /// edit), never per-frame.
+    fn rebuild_world_mesh(&mut self) {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for ((cx, cz), column) in self.chunks.columns() {
@@ -268,6 +288,20 @@ impl App {
                 vertices.extend(section_vertices);
             }
         }
+        self.world_vertices = vertices;
+        self.world_indices = indices;
+        self.world_mesh_dirty = false;
+    }
+
+    /// Copies the cached world mesh, appends fresh mob boxes at their current
+    /// positions, and uploads the combined buffer. The clone+append is a
+    /// plain memcpy-class cost (cheap); `set_mesh` itself is the expensive
+    /// part, which is why callers throttle how often this runs rather than
+    /// calling it unconditionally every frame.
+    fn upload_combined_mesh(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let mut vertices = self.world_vertices.clone();
+        let mut indices = self.world_indices.clone();
         for entity in &self.mobs {
             let (mob_vertices, mob_indices) = mob_box_mesh(entity.mob.position, MOB_SIZE, MOB_BLOCK);
             let base = vertices.len() as u32;
@@ -280,14 +314,15 @@ impl App {
     }
 
     /// Moves the streaming radius to follow the player and integrates any
-    /// finished background generation.
-    fn update_streaming(&mut self) {
+    /// finished background generation. Returns true if new sections landed
+    /// (world mesh needs rebuilding).
+    fn update_streaming(&mut self) -> bool {
         let center = world_chunk_of(self.player.position);
         if self.streaming_center != Some(center) {
             self.streaming_center = Some(center);
             self.chunks.set_center(center.0, center.1);
         }
-        self.chunks.pump();
+        self.chunks.pump() > 0
     }
 
     /// Advances each mob: pathfind toward the player (recomputed on a timer,
@@ -386,7 +421,9 @@ impl App {
         self.player.update(dt, wish, jump, |x, y, z| is_solid_in(chunks, x, y, z));
         self.camera.position = self.player.eye_position();
 
-        self.update_streaming();
+        if self.update_streaming() {
+            self.world_mesh_dirty = true;
+        }
         self.update_mobs(dt);
 
         if self.input.mine_requested || self.input.place_requested {
@@ -395,7 +432,18 @@ impl App {
         self.input.mine_requested = false;
         self.input.place_requested = false;
 
-        self.rebuild_mesh();
+        // Rebuild (expensive: re-triangulates the world) only when the world
+        // actually changed; upload (also expensive: see MESH_UPLOAD_INTERVAL)
+        // at a bounded rate rather than every frame, so continuous mob motion
+        // can't reintroduce the per-frame GPU stall this replaced.
+        if self.world_mesh_dirty {
+            self.rebuild_world_mesh();
+        }
+        self.mesh_upload_accum += dt;
+        if self.mesh_upload_accum >= MESH_UPLOAD_INTERVAL {
+            self.mesh_upload_accum = 0.0;
+            self.upload_combined_mesh();
+        }
 
         if let Some(renderer) = self.renderer.as_mut() {
             if let Err(e) = renderer.render_frame(&self.camera) {
@@ -443,7 +491,11 @@ impl App {
         let (cx, cz) = (world.x.div_euclid(SECTION_DIM), world.z.div_euclid(SECTION_DIM));
         let (lx, lz) =
             (world.x.rem_euclid(SECTION_DIM) as usize, world.z.rem_euclid(SECTION_DIM) as usize);
-        self.chunks.set_block(cx, cz, lx, world.y, lz, block)
+        let edited = self.chunks.set_block(cx, cz, lx, world.y, lz, block);
+        if edited {
+            self.world_mesh_dirty = true;
+        }
+        edited
     }
 
     fn held(&self, key: KeyCode) -> bool {
@@ -510,7 +562,9 @@ impl ApplicationHandler for App {
         }
         self.chunks.pump();
 
-        self.rebuild_mesh();
+        self.rebuild_world_mesh();
+        self.upload_combined_mesh();
+        self.mesh_upload_accum = 0.0;
         self.last_frame = Some(Instant::now());
     }
 
