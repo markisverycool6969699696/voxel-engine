@@ -71,6 +71,18 @@ pub struct MeshVertex {
     pub shade: f32,
 }
 
+/// A screen-space (NDC, i.e. already `[-1, 1]`, no camera transform applied)
+/// flat-colored vertex — crosshair, inventory swatches, menu buttons. Layout
+/// matches `render-vk`'s UI pipeline's vertex input state; the two must be
+/// changed together.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UiVertex {
+    pub position: [f32; 2],
+    /// RGBA, 0..1.
+    pub color: [f32; 4],
+}
+
 /// Deterministic atlas tile index per block id — same "hash the id" idea the
 /// old debug-color placeholder used, just indexing into the atlas instead of
 /// picking a flat color directly.
