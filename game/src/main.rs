@@ -564,10 +564,18 @@ impl App {
         // Mark sections dirty *before* handing ownership to `load_saved` —
         // any of these already loaded (from resumed()'s startup neighborhood)
         // just got silently overwritten underneath the mesh cache, which
-        // otherwise has no way to know they changed.
+        // otherwise has no way to know they changed. Also mark their
+        // vertical neighbors: greedy_mesh_with_y_neighbors culls a section's
+        // top/bottom face against the real adjacent section, so an override
+        // can change what an already-cached neighbor's boundary face should
+        // look like too. Unconditional (not just boundary-layer edits, the
+        // way the hot-path set_world_block does it) is fine here — this
+        // runs once at load time, not on every block break.
         for ((cx, cz), column) in &saved.columns {
             for (sy, _) in column.loaded_sections() {
                 self.dirty_sections.insert((*cx, sy, *cz));
+                self.dirty_sections.insert((*cx, sy - 1, *cz));
+                self.dirty_sections.insert((*cx, sy + 1, *cz));
             }
         }
         self.chunks.load_saved(saved.columns);
@@ -838,19 +846,25 @@ impl App {
         let edited = self.chunks.set_block(cx, cz, lx, world.y, lz, block);
         if edited {
             // The edited section always needs re-meshing. Its vertical
-            // neighbors also might: greedy_mesh_with_y_neighbors culls a
-            // section's top/bottom boundary face against the real adjacent
-            // section, so an edit at the very top or bottom layer of this
-            // section can change what the neighbor's boundary face should
-            // look like too. Marking both neighbors dirty unconditionally
-            // (not just when the edit is actually at the boundary) is
-            // simpler and still cheap — re-meshing one extra section is far
-            // below the cost this per-section cache exists to avoid (a full
-            // chunk-radius re-mesh).
+            // neighbors only need it if the edit actually touched this
+            // section's own top or bottom layer (local y 15 or 0) —
+            // greedy_mesh_with_y_neighbors culls a section's boundary face
+            // against the real adjacent section, so only an edit *at* that
+            // boundary can change what the neighbor's boundary face should
+            // look like. Marking neighbors dirty unconditionally on every
+            // edit (an earlier version of this fix did that) tripled the
+            // greedy-mesh cost of every single block break/place — the vast
+            // majority of edits are nowhere near a section boundary and
+            // don't need it, and that was a real, reported lag regression
+            // (see MEMORY.md).
             let sy = world.y.div_euclid(SECTION_DIM);
+            let ly = world.y.rem_euclid(SECTION_DIM);
             self.dirty_sections.insert((cx, sy, cz));
-            self.dirty_sections.insert((cx, sy - 1, cz));
-            self.dirty_sections.insert((cx, sy + 1, cz));
+            if ly == 0 {
+                self.dirty_sections.insert((cx, sy - 1, cz));
+            } else if ly == SECTION_DIM - 1 {
+                self.dirty_sections.insert((cx, sy + 1, cz));
+            }
             self.world_mesh_dirty = true;
         }
         edited
