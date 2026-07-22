@@ -15,16 +15,19 @@ regenerated on demand rather than stored. You spawn on the surface and can walk,
 mine/place blocks in it.
 
 **Working:**
-- Vulkan 1.3 renderer (dynamic rendering, depth testing, back-face culling) with a placeholder
-  procedurally-generated texture atlas
+- Vulkan 1.3 renderer (dynamic rendering, depth testing, back-face culling) with a **real texture
+  atlas** — 74 GPL v2 block textures (see [Known Issues](#known-issues) for the few blocks that
+  still fall back to a flat color) plus a second screen-space UI pipeline for the crosshair/
+  inventory
 - Palette-compressed chunk storage and greedy meshing
 - **Seeded world generation**: layered value-noise heightmap terrain, temperature/humidity biomes
   (with blended elevation), water below sea level, 3D-noise caves, ore, and trees — fully
   deterministic (unmodified chunks are regenerated, never stored)
 - Background chunk streaming (multi-worker, load/unload by radius) driving the generator
 - Physics: gravity, AABB collision, jumping, and creative-mode flight (`F` to toggle)
-- Mining and placing blocks via voxel raycasting, with a hotbar backed by the data-driven
-  block/item registry (JSON)
+- Mining and placing blocks via voxel raycasting, with a **76-item inventory picker** (`E` to
+  open, click any registered block to select it) backed by the data-driven block/item registry
+  (JSON)
 - Synthesized sound effects for mining/placing (placeholder tones, not real samples — see
   [Known Issues](#known-issues))
 - A couple of placeholder mobs (gravity + collision, rendered as solid-color boxes) that
@@ -33,10 +36,11 @@ mine/place blocks in it.
   roster, but the movement/collision/pathfinding/rendering path is all real.
 
 **Not yet built:**
-- Real textures (the atlas is still procedural placeholder colors per block id) and an inventory
-  UI — see `docs/STARTER.md` §8 for open decisions
 - Fluid behavior (water is currently a solid, walkable block, not a flowing fluid), multiplayer,
   the macOS/Metal backend
+- Main menu / save-load / Creative-Survival distinction (these existed at one point this project's
+  history but were deliberately reverted along with some bug fixes during a rough session — see
+  MEMORY.md; still recoverable from git history if wanted again)
 
 See [MEMORY.md](MEMORY.md) for the full development log, and [project.md](project.md) for planning
 notes.
@@ -53,8 +57,9 @@ notes.
 | `Ctrl` | Descend (while flying) |
 | Left click | Mine (break) the targeted block |
 | Right click | Place the selected block |
-| `1`–`4` | Select hotbar item |
-| `Esc` | Free the cursor (click back in, or press `Esc` again, to resume) |
+| `E` | Open/close the inventory — click a swatch to select that block |
+| `1`–`4` | Select hotbar item (a few quick-access defaults; the full catalog is in the inventory) |
+| `Esc` | Close the inventory if open, else free the cursor (click back in, or press `Esc` again, to resume) |
 | Alt+F4 / window close button | Quit |
 
 ## Building
@@ -100,9 +105,10 @@ game/          binary crate tying engine-core + render-vk together (+ data/ bloc
 
 ## Known issues
 
-- Textures are placeholder: each block id hashes to a flat-colored atlas tile, so grass/water/etc.
-  aren't their "expected" colors yet. Terrain *shape* is real; block *coloring* is a stand-in until
-  a real asset set is chosen (`docs/STARTER.md` §8).
+- Most blocks use real GPL v2 textures (see [Credits](CREDITS.md)), but that pack is meant to
+  supplement vanilla Minecraft, not replace it — it has no water/lava/snow textures, so those
+  specific block ids still render a flat procedural color (see
+  `engine_core::mesh::ATLAS_TILES`).
 - Water is a solid, walkable block, not a flowing fluid — real fluid behavior (the `fluid`
   behavior tag exists in the registry for it) is future work.
 - Sound is synthesized placeholder tones (no real sound assets — see the open decision in
@@ -114,5 +120,5 @@ game/          binary crate tying engine-core + render-vk together (+ data/ bloc
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). Third-party crate dependencies are MIT/Apache-2.0. No third-party
-assets are bundled yet; see [CREDITS.md](CREDITS.md) for tracking once any are added.
+[AGPL-3.0-or-later](LICENSE). Third-party crate dependencies are MIT/Apache-2.0. Block textures
+are GPL v2 (SimpleRP) — see [CREDITS.md](CREDITS.md) for full attribution.
