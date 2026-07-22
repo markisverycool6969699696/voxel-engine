@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use engine_core::camera::Camera;
 use engine_core::chunk::{BlockId, PalettedSection, AIR};
-use engine_core::mesh::{greedy_mesh, triangulate, MeshVertex};
+use engine_core::mesh::{greedy_mesh, greedy_mesh_with_y_neighbors, triangulate, MeshVertex};
 use engine_core::mob::Mob;
 use engine_core::pathfind::{find_path, Cell, NavConfig};
 use engine_core::physics::PlayerController;
@@ -362,6 +362,30 @@ impl App {
     /// over however many sections are currently loaded — cheap relative to
     /// greedy-meshing, which is the part this cache actually avoids repeating.
     fn rebuild_world_mesh(&mut self) {
+        // A section's mesh now depends on its vertically-adjacent sections'
+        // data too (see greedy_mesh_with_y_neighbors), not just its own
+        // content. So whenever a section is about to be meshed for the
+        // first time (newly streamed in), any already-cached neighbor above/
+        // below it was meshed assuming "no neighbor" (open boundary) and is
+        // now stale — its top/bottom face may need to disappear now that a
+        // real neighbor exists. Mark those neighbors dirty *before* the main
+        // pass below so they get re-meshed in this same call regardless of
+        // iteration order (the main loop reads live data from `self.chunks`
+        // either way, so re-meshing order within one call doesn't matter,
+        // only whether a section ends up marked dirty before it's visited).
+        for ((cx, cz), column) in self.chunks.columns() {
+            for (sy, _) in column.loaded_sections() {
+                if !self.section_meshes.contains_key(&(cx, sy, cz)) {
+                    for neighbor_sy in [sy - 1, sy + 1] {
+                        let neighbor_key = (cx, neighbor_sy, cz);
+                        if self.section_meshes.contains_key(&neighbor_key) {
+                            self.dirty_sections.insert(neighbor_key);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut still_loaded = HashSet::with_capacity(self.section_meshes.len());
         for ((cx, cz), column) in self.chunks.columns() {
             for (sy, section) in column.loaded_sections() {
@@ -370,7 +394,17 @@ impl App {
                 if self.section_meshes.contains_key(&key) && !self.dirty_sections.contains(&key) {
                     continue; // cached and unchanged
                 }
-                let quads = greedy_mesh(section, |b| b != AIR);
+                // Pass the real vertically-adjacent sections so a section's
+                // top/bottom boundary faces are culled correctly against
+                // whatever's actually there, instead of always assuming
+                // open air (see greedy_mesh_with_y_neighbors's doc comment —
+                // this was a real, visible bug around sea level specifically).
+                let quads = greedy_mesh_with_y_neighbors(
+                    section,
+                    |b| b != AIR,
+                    column.section(sy - 1),
+                    column.section(sy + 1),
+                );
                 let (mut vertices, indices) = triangulate(&quads);
                 let offset = Vec3::new(
                     (cx * SECTION_DIM) as f32,
@@ -803,13 +837,20 @@ impl App {
             (world.x.rem_euclid(SECTION_DIM) as usize, world.z.rem_euclid(SECTION_DIM) as usize);
         let edited = self.chunks.set_block(cx, cz, lx, world.y, lz, block);
         if edited {
-            // Each section's mesh only depends on its own content (greedy_mesh
-            // never looks across section boundaries — a solid block at a
-            // section's own top/bottom slice is always treated as exposed
-            // there regardless of the neighbor), so only this one section
-            // needs re-meshing, not the whole world.
+            // The edited section always needs re-meshing. Its vertical
+            // neighbors also might: greedy_mesh_with_y_neighbors culls a
+            // section's top/bottom boundary face against the real adjacent
+            // section, so an edit at the very top or bottom layer of this
+            // section can change what the neighbor's boundary face should
+            // look like too. Marking both neighbors dirty unconditionally
+            // (not just when the edit is actually at the boundary) is
+            // simpler and still cheap — re-meshing one extra section is far
+            // below the cost this per-section cache exists to avoid (a full
+            // chunk-radius re-mesh).
             let sy = world.y.div_euclid(SECTION_DIM);
             self.dirty_sections.insert((cx, sy, cz));
+            self.dirty_sections.insert((cx, sy - 1, cz));
+            self.dirty_sections.insert((cx, sy + 1, cz));
             self.world_mesh_dirty = true;
         }
         edited

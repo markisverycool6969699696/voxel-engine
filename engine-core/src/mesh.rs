@@ -140,9 +140,39 @@ pub fn triangulate(quads: &[Quad]) -> (Vec<MeshVertex>, Vec<u32>) {
 
 /// Greedy-meshes one section. `is_opaque` decides which blocks emit faces;
 /// faces are emitted where an opaque block meets a non-opaque one.
-pub fn greedy_mesh(
+pub fn greedy_mesh(section: &PalettedSection, is_opaque: impl Fn(BlockId) -> bool) -> Vec<Quad> {
+    greedy_mesh_with_y_neighbors(section, is_opaque, None, None)
+}
+
+/// Like [`greedy_mesh`], but additionally culls top/bottom (Y-axis) faces at
+/// this section's vertical boundaries against the *real* adjacent section
+/// in the same column when one is given, instead of unconditionally treating
+/// the boundary as exposed.
+///
+/// Without this, every section's top and bottom layer emits faces
+/// regardless of what's actually in the neighboring section — harmless when
+/// that neighbor is solid rock nobody looks at from below, but `SEA_LEVEL`
+/// (64) sits exactly on a section boundary (`64 = 4 * 16`), so the grass/
+/// dirt/water transition that happens right around sea level straddles this
+/// exact seam almost everywhere near the surface: a section's dirt-colored
+/// top layer would render as a visible "phantom" exposed face even where a
+/// real grass block sat directly on top of it in the section above,
+/// completely unrelated to what the terrain actually looked like there.
+/// This was reported as "ground looks like dirt/holes, not grass" and
+/// diagnosed by reproducing the exact generate → mesh pipeline rather than
+/// guessed (see MEMORY.md).
+///
+/// `below`/`above` are the sections immediately below/above this one in the
+/// same column; `None` (not loaded, or the very top/bottom of the world)
+/// falls back to the previous always-exposed behavior. Horizontal (X/Z)
+/// section-boundary culling is unaffected — cross-*column* culling would
+/// need neighbor-column data threaded through streaming, a separate, larger
+/// change than this fix, and stays future work.
+pub fn greedy_mesh_with_y_neighbors(
     section: &PalettedSection,
     is_opaque: impl Fn(BlockId) -> bool,
+    below: Option<&PalettedSection>,
+    above: Option<&PalettedSection>,
 ) -> Vec<Quad> {
     let mut quads = Vec::new();
     // Fully non-opaque uniform sections (air) are the overwhelmingly common
@@ -174,18 +204,26 @@ pub fn greedy_mesh(
                         if !is_opaque(block) {
                             continue;
                         }
+                        // pos[0]/pos[2] are always the true x/z regardless of
+                        // axis (only meaningful when axis == 1, guarded below).
                         let exposed = if positive {
-                            slice + 1 >= N || {
+                            if slice + 1 < N {
                                 let mut n = pos;
                                 n[axis] += 1;
                                 !is_opaque(at(n))
+                            } else if axis == 1 {
+                                above.is_none_or(|s| !is_opaque(s.get(pos[0], 0, pos[2])))
+                            } else {
+                                true
                             }
+                        } else if slice > 0 {
+                            let mut n = pos;
+                            n[axis] -= 1;
+                            !is_opaque(at(n))
+                        } else if axis == 1 {
+                            below.is_none_or(|s| !is_opaque(s.get(pos[0], N - 1, pos[2])))
                         } else {
-                            slice == 0 || {
-                                let mut n = pos;
-                                n[axis] -= 1;
-                                !is_opaque(at(n))
-                            }
+                            true
                         };
                         if exposed {
                             mask[v][u] = Some(block);
@@ -362,6 +400,41 @@ mod tests {
         assert_eq!(quads.len(), 10);
         assert_eq!(total_area(&quads), 10.0);
         assert!(quads.iter().all(|q| q.area() == 1.0));
+    }
+
+    #[test]
+    fn y_neighbor_culls_the_phantom_boundary_face() {
+        // A full-stone section with a full-stone section directly above it:
+        // the top layer's up-face must NOT be emitted, because the real
+        // section above completely covers it -- this is exactly the bug
+        // reported as "ground looks like dirt/holes instead of grass" (a
+        // section's top boundary defaulting to "always exposed" even when
+        // the section above it is solid; SEA_LEVEL sits exactly on a
+        // section boundary, so this was visible almost everywhere near the
+        // surface). See MEMORY.md for the full diagnosis.
+        let lower = PalettedSection::filled(STONE);
+        let upper = PalettedSection::filled(STONE);
+        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, None, Some(&upper));
+        let up: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, 1.0, 0.0]).collect();
+        assert!(up.is_empty(), "top face should be culled by the solid section above it");
+
+        // Same section with an AIR section above it (a real gap, e.g. sky):
+        // the up-face must still be emitted.
+        let air_above = PalettedSection::filled(AIR);
+        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, None, Some(&air_above));
+        let up: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, 1.0, 0.0]).collect();
+        assert_eq!(up.len(), 1, "top face must stay exposed when the neighbor is actually open");
+
+        // No neighbor data available (unloaded / world edge): falls back to
+        // the old always-exposed behavior, same as plain `greedy_mesh`.
+        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, None, None);
+        let up: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, 1.0, 0.0]).collect();
+        assert_eq!(up.len(), 1, "must default to exposed when no neighbor section is given");
+
+        // Symmetric check for the bottom boundary against `below`.
+        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, Some(&upper), None);
+        let down: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, -1.0, 0.0]).collect();
+        assert!(down.is_empty(), "bottom face should be culled by the solid section below it");
     }
 
     #[test]

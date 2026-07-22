@@ -342,6 +342,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generated_sections_have_no_phantom_dirt_faces_at_vertical_boundaries() {
+        // Regression test for a real bug found via a screenshot report
+        // ("ground looks like dirt/holes instead of grass"): SEA_LEVEL (64)
+        // sits exactly on a section boundary (64 = 4 * 16), and
+        // `greedy_mesh` used to treat every section's top/bottom boundary as
+        // unconditionally exposed, ignoring whatever the real neighboring
+        // section contained. That produced a visible DIRT-colored "phantom"
+        // face wherever a column's grass cap happened to sit in the section
+        // above a subsurface dirt layer -- which, given the sea-level
+        // alignment, was most near-surface terrain. Fixed by
+        // `greedy_mesh_with_y_neighbors` (see mesh.rs); this test exercises
+        // the exact generate() -> mesh pipeline the game uses (not just the
+        // isolated mesh.rs unit test) and asserts no such face survives.
+        use crate::chunk::ChunkColumn;
+        use crate::mesh::greedy_mesh_with_y_neighbors;
+        let g = TerrainGenerator::new(0x5EED_1234);
+        let opaque = |b: BlockId| b != AIR;
+        for cx in -3..3 {
+            for cz in -3..3 {
+                let mut column = ChunkColumn::new();
+                for sy in 1..7 {
+                    column.insert_section(sy, g.generate(cx, sy, cz));
+                }
+                for sy in 1..7 {
+                    let section = column.section(sy).unwrap();
+                    let quads = greedy_mesh_with_y_neighbors(
+                        section,
+                        opaque,
+                        column.section(sy - 1),
+                        column.section(sy + 1),
+                    );
+                    for q in &quads {
+                        if q.normal != [0.0, 1.0, 0.0] || q.block != DIRT {
+                            continue;
+                        }
+                        let wy = sy * DIM + q.corners[0][1] as i32;
+                        let wx = cx * DIM + q.corners[0][0] as i32;
+                        let wz = cz * DIM + q.corners[0][2] as i32;
+                        let col = g.column(wx, wz);
+                        let has_water_or_solid_above = (wy..=(SEA_LEVEL + 1))
+                            .any(|y| g.block_at(wx, y, wz, &col) != AIR);
+                        assert!(
+                            has_water_or_solid_above,
+                            "phantom exposed dirt quad at wx={wx} wy={wy} wz={wz}, \
+                             col.height={} (nothing solid/water covers it up to sea level)",
+                            col.height
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn generation_is_deterministic() {
         let a = TerrainGenerator::new(1234);
         let b = TerrainGenerator::new(1234);
