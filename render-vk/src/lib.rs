@@ -63,9 +63,10 @@ use vk_mem::{Alloc, AllocationCreateFlags, AllocationCreateInfo, Allocator, Allo
 use winit::window::Window;
 
 use engine_core::camera::Camera;
-use engine_core::mesh::{MeshVertex, ATLAS_TILE_COUNT};
+use engine_core::mesh::{MeshVertex, TileSource, UiVertex, ATLAS_TILES, ATLAS_TILE_COUNT};
 use engine_core::Renderer;
 
+mod atlas_textures;
 mod shader;
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -95,35 +96,95 @@ struct GlobalsUbo {
     _pad: [f32; 3],
 }
 
-/// Procedurally generates a single-row atlas: `ATLAS_TILE_COUNT` tiles of
-/// `ATLAS_TILE_SIZE`² pixels, each a hashed base color with a coarse 4x4
-/// checker so it reads as "textured" rather than a flat swatch — same
-/// "hash the id" idea the pre-atlas debug coloring used, just baked into
-/// pixels instead of a per-vertex color.
+/// Builds a single-row atlas: one `ATLAS_TILE_SIZE`² tile per
+/// `engine_core::mesh::ATLAS_TILES` entry, in order. `TileSource::Png` tiles
+/// are decoded from the real embedded GPL v2 textures (see
+/// `atlas_textures`/CREDITS.md); `TileSource::Solid` tiles (water, snow,
+/// the mob debug marker — no equivalent in that pack) get a flat color with
+/// a coarse 4x4 checker, the same treatment the whole atlas used to get
+/// before real textures existed, so they still read as "a tile" rather
+/// than a flat swatch.
 fn generate_atlas_pixels() -> Vec<u8> {
     let (width, height) = (ATLAS_TILE_COUNT * ATLAS_TILE_SIZE, ATLAS_TILE_SIZE);
     let mut pixels = vec![0u8; (width * height * 4) as usize];
-    for tile in 0..ATLAS_TILE_COUNT {
-        let h = tile.wrapping_mul(2654435761);
-        let base = [
-            80 + (h & 0x7F) as u8,
-            80 + ((h >> 8) & 0x7F) as u8,
-            80 + ((h >> 16) & 0x7F) as u8,
-        ];
-        for y in 0..ATLAS_TILE_SIZE {
-            for x in 0..ATLAS_TILE_SIZE {
-                let darker = ((x / 4) + (y / 4)) % 2 == 0;
-                let mul = if darker { 0.75 } else { 1.0 };
-                let px = tile * ATLAS_TILE_SIZE + x;
-                let idx = ((y * width + px) * 4) as usize;
-                pixels[idx] = (base[0] as f32 * mul) as u8;
-                pixels[idx + 1] = (base[1] as f32 * mul) as u8;
-                pixels[idx + 2] = (base[2] as f32 * mul) as u8;
-                pixels[idx + 3] = 255;
+    for (tile, &(block_id, source)) in ATLAS_TILES.iter().enumerate() {
+        let tile = tile as u32;
+        match source {
+            TileSource::Png(name) => {
+                let bytes = atlas_textures::png_bytes(name)
+                    .unwrap_or_else(|| panic!("no embedded texture for {name:?} (block {block_id})"));
+                let img = image::load_from_memory(bytes)
+                    .unwrap_or_else(|e| panic!("failed to decode {name:?}.png: {e:#}"))
+                    .to_rgba8();
+                assert_eq!(
+                    (img.width(), img.height()),
+                    (ATLAS_TILE_SIZE, ATLAS_TILE_SIZE),
+                    "{name:?}.png must be {ATLAS_TILE_SIZE}x{ATLAS_TILE_SIZE}"
+                );
+                for y in 0..ATLAS_TILE_SIZE {
+                    for x in 0..ATLAS_TILE_SIZE {
+                        let src = img.get_pixel(x, y).0;
+                        let px = tile * ATLAS_TILE_SIZE + x;
+                        let idx = ((y * width + px) * 4) as usize;
+                        pixels[idx..idx + 4].copy_from_slice(&src);
+                    }
+                }
+            }
+            TileSource::Solid(base) => {
+                for y in 0..ATLAS_TILE_SIZE {
+                    for x in 0..ATLAS_TILE_SIZE {
+                        let darker = ((x / 4) + (y / 4)) % 2 == 0;
+                        let mul = if darker { 0.75 } else { 1.0 };
+                        let px = tile * ATLAS_TILE_SIZE + x;
+                        let idx = ((y * width + px) * 4) as usize;
+                        pixels[idx] = (base[0] as f32 * mul) as u8;
+                        pixels[idx + 1] = (base[1] as f32 * mul) as u8;
+                        pixels[idx + 2] = (base[2] as f32 * mul) as u8;
+                        pixels[idx + 3] = 255;
+                    }
+                }
             }
         }
     }
     pixels
+}
+
+/// Average color of a block's atlas tile, RGBA 0..1 — for UI swatches (the
+/// inventory picker) that should visually match the real in-world texture
+/// rather than showing an arbitrary hash color. `Solid` tiles return their
+/// exact color; `Png` tiles are decoded and averaged (a tiny 16x16 image,
+/// cheap enough to redo per call — this only runs when the inventory UI
+/// rebuilds, not every frame). Falls back to mid-gray for an unregistered
+/// block id.
+pub fn swatch_color(block_id: u16) -> [f32; 4] {
+    let Some(&(_, source)) = ATLAS_TILES.iter().find(|&&(id, _)| id == block_id) else {
+        return [0.6, 0.6, 0.6, 1.0];
+    };
+    match source {
+        TileSource::Solid([r, g, b]) => {
+            [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+        }
+        TileSource::Png(name) => {
+            let bytes = atlas_textures::png_bytes(name)
+                .unwrap_or_else(|| panic!("no embedded texture for {name:?}"));
+            let img = image::load_from_memory(bytes)
+                .unwrap_or_else(|e| panic!("failed to decode {name:?}.png: {e:#}"))
+                .to_rgba8();
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            let n = (img.width() * img.height()).max(1);
+            for p in img.pixels() {
+                r += p[0] as u32;
+                g += p[1] as u32;
+                b += p[2] as u32;
+            }
+            [
+                (r / n) as f32 / 255.0,
+                (g / n) as f32 / 255.0,
+                (b / n) as f32 / 255.0,
+                1.0,
+            ]
+        }
+    }
 }
 
 struct FrameSync {
@@ -182,6 +243,17 @@ pub struct VkRenderer {
 
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+
+    // Screen-space UI overlay: no depth test, no culling, alpha-blended,
+    // empty descriptor/pipeline layout (NDC-direct vertices, no camera/atlas
+    // needed), drawn in the same render pass right after the world mesh.
+    ui_pipeline_layout: vk::PipelineLayout,
+    ui_pipeline: vk::Pipeline,
+    ui_vertex_buffer: vk::Buffer,
+    ui_vertex_allocation: vk_mem::Allocation,
+    ui_index_buffer: vk::Buffer,
+    ui_index_allocation: vk_mem::Allocation,
+    ui_index_count: u32,
 
     // Dropped explicitly (before device destruction) in `Drop::drop` — see there for why.
     allocator: ManuallyDrop<Allocator>,
@@ -345,6 +417,13 @@ impl VkRenderer {
                 descriptor_sets: Vec::new(),
                 pipeline_layout: vk::PipelineLayout::null(),
                 pipeline: vk::Pipeline::null(),
+                ui_pipeline_layout: vk::PipelineLayout::null(),
+                ui_pipeline: vk::Pipeline::null(),
+                ui_vertex_buffer: vk::Buffer::null(),
+                ui_vertex_allocation: std::mem::zeroed(),
+                ui_index_buffer: vk::Buffer::null(),
+                ui_index_allocation: std::mem::zeroed(),
+                ui_index_count: 0,
                 mesh_vertex_buffer: vk::Buffer::null(),
                 mesh_vertex_allocation: std::mem::zeroed(),
                 mesh_index_buffer: vk::Buffer::null(),
@@ -356,6 +435,7 @@ impl VkRenderer {
             renderer.create_globals()?;
             renderer.create_swapchain()?;
             renderer.create_pipeline()?;
+            renderer.create_ui_pipeline()?;
             Ok(renderer)
         }
     }
@@ -615,6 +695,21 @@ impl VkRenderer {
         Ok((buffer, allocation))
     }
 
+    fn destroy_ui_buffers(&mut self) {
+        unsafe {
+            if self.ui_vertex_buffer != vk::Buffer::null() {
+                self.allocator
+                    .destroy_buffer(self.ui_vertex_buffer, &mut self.ui_vertex_allocation);
+                self.ui_vertex_buffer = vk::Buffer::null();
+            }
+            if self.ui_index_buffer != vk::Buffer::null() {
+                self.allocator
+                    .destroy_buffer(self.ui_index_buffer, &mut self.ui_index_allocation);
+                self.ui_index_buffer = vk::Buffer::null();
+            }
+        }
+    }
+
     fn destroy_mesh_buffers(&mut self) {
         unsafe {
             if self.mesh_vertex_buffer != vk::Buffer::null() {
@@ -776,6 +871,125 @@ impl VkRenderer {
 
             self.pipeline_layout = layout;
             self.pipeline = pipeline;
+            Ok(())
+        }
+    }
+
+    /// Builds the screen-space UI overlay pipeline: no depth test (always on
+    /// top), no culling (arbitrary 2D quads, not solid geometry), alpha
+    /// blended, empty pipeline/descriptor layout (NDC-direct vertices need
+    /// no camera transform or texture). Same lifetime as `create_pipeline` —
+    /// built once, not tied to swapchain recreation.
+    fn create_ui_pipeline(&mut self) -> Result<()> {
+        unsafe {
+            let spirv = shader::compile_wgsl_to_spirv(include_str!("../shaders/ui.wgsl"))?;
+            let module = self.device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&spirv),
+                None,
+            )?;
+
+            let vert_stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(module)
+                .name(c"vs_main");
+            let frag_stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(module)
+                .name(c"fs_main");
+            let stages = [vert_stage, frag_stage];
+
+            let binding_desc = vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(std::mem::size_of::<UiVertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX);
+            let attribute_descs = [
+                vk::VertexInputAttributeDescription::default()
+                    .location(0)
+                    .binding(0)
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .offset(std::mem::offset_of!(UiVertex, position) as u32),
+                vk::VertexInputAttributeDescription::default()
+                    .location(1)
+                    .binding(0)
+                    .format(vk::Format::R32G32B32A32_SFLOAT)
+                    .offset(std::mem::offset_of!(UiVertex, color) as u32),
+            ];
+            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(std::slice::from_ref(&binding_desc))
+                .vertex_attribute_descriptions(&attribute_descs);
+            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic_state =
+                vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1)
+                .scissor_count(1);
+
+            let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::CLOCKWISE)
+                .line_width(1.0);
+            let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(false)
+                .depth_write_enable(false)
+                .depth_compare_op(vk::CompareOp::ALWAYS);
+
+            let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD);
+            let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&blend_attachment));
+
+            // No descriptor sets: UI vertices carry their own NDC position
+            // and color directly, no camera/atlas sampling needed.
+            let layout = self
+                .device
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
+
+            let color_formats = [self.swapchain_format.format];
+            let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(&color_formats)
+                .depth_attachment_format(self.depth_format);
+
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&depth_stencil)
+                .color_blend_state(&color_blend)
+                .dynamic_state(&dynamic_state)
+                .layout(layout)
+                .push_next(&mut rendering_info);
+
+            let pipeline = self
+                .device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&pipeline_info),
+                    None,
+                )
+                .map_err(|(_, e)| e)
+                .context("vkCreateGraphicsPipelines (ui) failed")?[0];
+
+            self.device.destroy_shader_module(module, None);
+
+            self.ui_pipeline_layout = layout;
+            self.ui_pipeline = pipeline;
             Ok(())
         }
     }
@@ -1057,6 +1271,19 @@ impl VkRenderer {
                 self.device.cmd_draw_indexed(cmd, self.mesh_index_count, 1, 0, 0, 0);
             }
 
+            if self.ui_index_count > 0 {
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ui_pipeline);
+                self.device
+                    .cmd_bind_vertex_buffers(cmd, 0, &[self.ui_vertex_buffer], &[0]);
+                self.device.cmd_bind_index_buffer(
+                    cmd,
+                    self.ui_index_buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                self.device.cmd_draw_indexed(cmd, self.ui_index_count, 1, 0, 0, 0);
+            }
+
             self.device.cmd_end_rendering(cmd);
 
             // COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC
@@ -1192,6 +1419,33 @@ impl Renderer for VkRenderer {
             Ok(())
         }
     }
+
+    fn set_ui_mesh(&mut self, vertices: &[UiVertex], indices: &[u32]) -> Result<()> {
+        unsafe {
+            // Same wait-idle-then-recreate contract as `set_mesh` — see its
+            // comment. Called at most a few times per second (once per menu/
+            // inventory toggle, once per resize), not every frame.
+            self.device.device_wait_idle()?;
+            self.destroy_ui_buffers();
+
+            if vertices.is_empty() || indices.is_empty() {
+                self.ui_index_count = 0;
+                return Ok(());
+            }
+
+            let (vb, va) = self
+                .create_mapped_buffer_with_data(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+            let (ib, ia) = self
+                .create_mapped_buffer_with_data(indices, vk::BufferUsageFlags::INDEX_BUFFER)?;
+
+            self.ui_vertex_buffer = vb;
+            self.ui_vertex_allocation = va;
+            self.ui_index_buffer = ib;
+            self.ui_index_allocation = ia;
+            self.ui_index_count = indices.len() as u32;
+            Ok(())
+        }
+    }
 }
 
 impl Drop for VkRenderer {
@@ -1203,6 +1457,11 @@ impl Drop for VkRenderer {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+
+            self.device.destroy_pipeline(self.ui_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.ui_pipeline_layout, None);
+            self.destroy_ui_buffers();
 
             self.destroy_mesh_buffers();
 

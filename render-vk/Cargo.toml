@@ -13,3 +13,4 @@ raw-window-handle = { workspace = true }
 winit = { workspace = true }
 naga = { version = "30.0.0", features = ["wgsl-in", "spv-out"] }
 vk-mem = "0.5.0"
+image = { version = "0.25", default-features = false, features = ["png"] }

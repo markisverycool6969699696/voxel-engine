@@ -33,11 +33,14 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    // Atlas is a single row of `atlas_tile_count` square tiles; `in.uv` is
-    // already the 0..1 corner coordinate within the assigned tile (see
-    // engine_core::mesh::triangulate — no per-block repeat on merged quads
-    // yet), so just offset by the tile index and rescale.
-    let atlas_uv = vec2<f32>((in.tile + in.uv.x) / globals.atlas_tile_count, in.uv.y);
+    // Atlas is a single row of `atlas_tile_count` square tiles. `in.uv` spans
+    // 0..width/0..height in block units (see engine_core::mesh::triangulate),
+    // not the unit square, so `fract()` it back down to one tile's worth
+    // before offsetting by the tile index — this is what makes the tile
+    // repeat once per block on a merged quad instead of stretching across
+    // the whole face.
+    let tile_uv = fract(in.uv);
+    let atlas_uv = vec2<f32>((in.tile + tile_uv.x) / globals.atlas_tile_count, tile_uv.y);
     let sampled = textureSample(atlas_tex, atlas_sampler, atlas_uv);
     return vec4<f32>(sampled.rgb * in.shade, sampled.a);
 }

@@ -32,6 +32,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 mod audio;
 use audio::Audio;
+mod ui;
 
 const SPRINT_MULTIPLIER: f32 = 1.6;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
@@ -53,13 +54,12 @@ const STREAMING: StreamingConfig = StreamingConfig {
     workers: 3,
 };
 
-/// Hotbar (number keys 1-4): item ids resolved through the data-driven
-/// `Registry<ItemDef>`/`Registry<BlockDef>` (see `data/items.json`,
-/// `data/blocks.json`) instead of a raw block-id array. Still the same 4
-/// debug-colored placeholder blocks as before — this wires the existing
-/// registry module into actual use, it doesn't invent new content (the
-/// "final v1 block/item list" is explicitly an open decision per
-/// docs/STARTER.md §8, not made here).
+/// Hotbar (number keys 1-4): a handful of quick-access defaults, resolved
+/// through the data-driven `Registry<ItemDef>`/`Registry<BlockDef>` (see
+/// `data/items.json`, `data/blocks.json`). The full 76-item catalog is
+/// reachable via the inventory picker (`E`) — the hotbar is just a
+/// convenience shortcut for a few common ones, not the only way to select
+/// a block.
 const HOTBAR_ITEM_IDS: [u16; 4] = [1, 2, 3, 4];
 
 /// Resolves a hotbar item id to the `BlockId` it places. Panics on a bad
@@ -70,6 +70,19 @@ fn block_for_item(items: &Registry<ItemDef>, blocks: &Registry<BlockDef>, item_i
     let block_key = item.places_block.as_deref().expect("hotbar item must place a block");
     let block = blocks.get(block_key).expect("places_block key must exist in blocks.json");
     BlockId(block.id)
+}
+
+/// Every placeable item as `(item_id, block_id)`, in registry order — the
+/// full catalog the inventory picker shows (not just the 4-slot hotbar).
+fn inventory_items(items: &Registry<ItemDef>, blocks: &Registry<BlockDef>) -> Vec<(u16, u16)> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let block_key = item.places_block.as_deref()?;
+            let block = blocks.get(block_key)?;
+            Some((item.id, block.id))
+        })
+        .collect()
 }
 
 /// Placeholder mob appearance/size — not a real mob roster, just enough to
@@ -161,6 +174,10 @@ fn world_chunk_of(pos: Vec3) -> (i32, i32) {
 struct Input {
     held: HashSet<KeyCode>,
     mouse_delta: (f64, f64),
+    /// Absolute cursor position in physical pixels — only meaningful (and
+    /// only tracked/used) while the cursor is unlocked, for UI click
+    /// hit-testing. Mouse-look uses `mouse_delta`, not this.
+    cursor_pos: (f64, f64),
     mine_requested: bool,
     place_requested: bool,
 }
@@ -204,6 +221,9 @@ struct App {
     /// — closing the window (Alt+F4 / the X button) still quits via
     /// `WindowEvent::CloseRequested`, unaffected by this.
     cursor_locked: bool,
+    /// `E` toggles this — opens the block picker (frees the cursor to click
+    /// a swatch, closes and re-locks on selection or `Esc`).
+    inventory_open: bool,
 }
 
 impl Default for App {
@@ -261,6 +281,7 @@ impl Default for App {
             world_mesh_dirty: true,
             mesh_upload_accum: 0.0,
             cursor_locked: true,
+            inventory_open: false,
         }
     }
 }
@@ -555,6 +576,69 @@ impl App {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             window.set_cursor_visible(true);
         }
+        self.rebuild_ui(); // crosshair only shows while locked
+    }
+
+    /// Rebuilds and uploads the screen-space UI overlay: the inventory grid
+    /// while it's open, else the crosshair while the cursor is locked
+    /// (nothing to aim at otherwise), else nothing. Call only on an actual
+    /// state change (inventory toggle, cursor lock toggle, resize) — like
+    /// `set_mesh`, `set_ui_mesh` has the same per-call cost as `set_mesh`,
+    /// never call unconditionally every frame.
+    fn rebuild_ui(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        if self.inventory_open {
+            let items = inventory_items(&self.items, &self.blocks);
+            let selected_id = items
+                .iter()
+                .find(|&&(_, block_id)| BlockId(block_id) == self.selected_block)
+                .map(|&(item_id, _)| item_id);
+            let (inv_v, inv_i) = ui::inventory_mesh(
+                &items,
+                selected_id,
+                self.camera.aspect,
+                render_vk::swatch_color,
+            );
+            let base = vertices.len() as u32;
+            indices.extend(inv_i.into_iter().map(|i| i + base));
+            vertices.extend(inv_v);
+        } else if self.cursor_locked {
+            let (cross_v, cross_i) = ui::crosshair(self.camera.aspect);
+            let base = vertices.len() as u32;
+            indices.extend(cross_i.into_iter().map(|i| i + base));
+            vertices.extend(cross_v);
+        }
+        if let Err(e) = renderer.set_ui_mesh(&vertices, &indices) {
+            eprintln!("ui mesh upload error: {e:#}");
+        }
+    }
+
+    /// Opens (frees the cursor) or closes (re-locks it) the inventory.
+    fn set_inventory_open(&mut self, open: bool) {
+        self.inventory_open = open;
+        self.set_cursor_lock(!open); // set_cursor_lock already calls rebuild_ui
+    }
+
+    /// Hit-tests the last known cursor position against the inventory grid;
+    /// selects the block under it and closes the inventory. No-op (leaves
+    /// the inventory open) if the click missed every cell — including the
+    /// dim backdrop, so clicking outside the grid doesn't silently no-op in
+    /// a confusing way, it's just not a hit.
+    fn pick_inventory_item_at_cursor(&mut self) {
+        let Some(window) = &self.window else { return };
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let ndc_x = (self.input.cursor_pos.0 / size.width as f64) as f32 * 2.0 - 1.0;
+        let ndc_y = (self.input.cursor_pos.1 / size.height as f64) as f32 * 2.0 - 1.0;
+        let items = inventory_items(&self.items, &self.blocks);
+        if let Some(idx) = ui::inventory_hit_test(ndc_x, ndc_y, items.len(), self.camera.aspect) {
+            self.selected_block = BlockId(items[idx].1);
+            self.set_inventory_open(false);
+        }
     }
 }
 
@@ -619,6 +703,7 @@ impl ApplicationHandler for App {
 
         self.rebuild_world_mesh();
         self.upload_combined_mesh();
+        self.rebuild_ui();
         self.mesh_upload_accum = 0.0;
         self.last_frame = Some(Instant::now());
     }
@@ -632,14 +717,23 @@ impl ApplicationHandler for App {
                 }
                 if size.width > 0 && size.height > 0 {
                     self.camera.aspect = size.width as f32 / size.height as f32;
+                    self.rebuild_ui(); // crosshair/inventory shape depends on aspect
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 if code == KeyCode::Escape && event.state == ElementState::Pressed {
-                    // Free the cursor instead of quitting — Alt+F4 / the
-                    // window's close button still quit normally.
-                    self.set_cursor_lock(!self.cursor_locked);
+                    if self.inventory_open {
+                        self.set_inventory_open(false);
+                    } else {
+                        // Free the cursor instead of quitting — Alt+F4 / the
+                        // window's close button still quit normally.
+                        self.set_cursor_lock(!self.cursor_locked);
+                    }
+                    return;
+                }
+                if code == KeyCode::KeyE && event.state == ElementState::Pressed {
+                    self.set_inventory_open(!self.inventory_open);
                     return;
                 }
                 if event.state == ElementState::Pressed {
@@ -667,8 +761,15 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.input.cursor_pos = (position.x, position.y);
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
-                if !self.cursor_locked {
+                if self.inventory_open {
+                    if button == MouseButton::Left {
+                        self.pick_inventory_item_at_cursor();
+                    }
+                } else if !self.cursor_locked {
                     // Click back into the window to resume, instead of that
                     // click registering as mine/place.
                     self.set_cursor_lock(true);

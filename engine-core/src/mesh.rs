@@ -44,17 +44,112 @@ impl Quad {
     }
 }
 
-/// Number of tiles in the placeholder texture atlas (a single row, each tile
-/// square). `render-vk` generates the actual atlas pixels at this same tile
-/// count — the two must be changed together, which is why this lives here
-/// as the one source of truth rather than as a duplicated literal in WGSL.
-pub const ATLAS_TILE_COUNT: u32 = 16;
+/// Where an atlas tile's pixels come from. Most blocks have a real texture
+/// (GPL v2, github.com/elhedran/SimpleRP — see CREDITS.md); a handful have
+/// no equivalent in that pack (it's meant to supplement vanilla Minecraft,
+/// not replace it) and fall back to a flat color, same idea as the original
+/// fully-procedural placeholder atlas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileSource {
+    /// File stem under `render-vk/assets/textures/blocks/<name>.png`.
+    Png(&'static str),
+    /// RGB, no real texture available for this block.
+    Solid([u8; 3]),
+}
+
+/// Ordered `(block_id, tile_source)` list — index in this array *is* the
+/// atlas tile index. `render-vk` builds the atlas by walking this list in
+/// order, so the two must be changed together; this is the one source of
+/// truth for both "how many tiles" and "which tile is which block" (no more
+/// hashing a block id into an arbitrary tile — each block needs *its own*
+/// specific texture now, not just a stable-but-arbitrary one).
+pub const ATLAS_TILES: &[(u16, TileSource)] = &[
+    (1, TileSource::Png("stone")),
+    (2, TileSource::Png("dirt")),
+    (3, TileSource::Png("grass_side")),
+    (4, TileSource::Png("sand")),
+    (5, TileSource::Solid([64, 128, 200])), // water: no texture in the pack
+    (6, TileSource::Png("log_oak")),
+    (7, TileSource::Png("leaves_oak_opaque")),
+    (8, TileSource::Solid([235, 235, 240])), // snow: no texture in the pack
+    (9, TileSource::Png("bedrock")),
+    (10, TileSource::Png("coal_ore")),
+    (11, TileSource::Png("iron_ore")),
+    (12, TileSource::Solid([200, 40, 40])), // mob_marker: debug, not real terrain
+    (13, TileSource::Png("cobblestone")),
+    (14, TileSource::Png("cobblestone_mossy")),
+    (15, TileSource::Png("stonebrick")),
+    (16, TileSource::Png("stonebrick_cracked")),
+    (17, TileSource::Png("stonebrick_mossy")),
+    (18, TileSource::Png("sandstone_normal")),
+    (19, TileSource::Png("gold_ore")),
+    (20, TileSource::Png("diamond_ore")),
+    (21, TileSource::Png("lapis_ore")),
+    (22, TileSource::Png("redstone_ore")),
+    (23, TileSource::Png("emerald_ore")),
+    (24, TileSource::Png("obsidian")),
+    (25, TileSource::Png("brick")),
+    (26, TileSource::Png("clay")),
+    (27, TileSource::Png("planks_oak")),
+    (28, TileSource::Png("planks_birch")),
+    (29, TileSource::Png("planks_spruce")),
+    (30, TileSource::Png("planks_jungle")),
+    (31, TileSource::Png("planks_acacia")),
+    (32, TileSource::Png("planks_big_oak")),
+    (33, TileSource::Png("log_birch")),
+    (34, TileSource::Png("log_spruce")),
+    (35, TileSource::Png("log_jungle")),
+    (36, TileSource::Png("log_acacia")),
+    (37, TileSource::Png("log_big_oak")),
+    (38, TileSource::Png("leaves_birch_opaque")),
+    (39, TileSource::Png("leaves_spruce_opaque")),
+    (40, TileSource::Png("leaves_jungle_opaque")),
+    (41, TileSource::Png("leaves_acacia_opaque")),
+    (42, TileSource::Png("leaves_big_oak_opaque")),
+    (43, TileSource::Png("glass")),
+    (44, TileSource::Png("glass_black")),
+    (45, TileSource::Png("glass_blue")),
+    (46, TileSource::Png("glass_brown")),
+    (47, TileSource::Png("glass_cyan")),
+    (48, TileSource::Png("glass_gray")),
+    (49, TileSource::Png("glass_green")),
+    (50, TileSource::Png("glass_light_blue")),
+    (51, TileSource::Png("glass_lime")),
+    (52, TileSource::Png("glass_magenta")),
+    (53, TileSource::Png("glass_orange")),
+    (54, TileSource::Png("glass_pink")),
+    (55, TileSource::Png("glass_purple")),
+    (56, TileSource::Png("glass_red")),
+    (57, TileSource::Png("glass_silver")),
+    (58, TileSource::Png("glass_white")),
+    (59, TileSource::Png("glass_yellow")),
+    (60, TileSource::Png("hardened_clay")),
+    (61, TileSource::Png("hardened_clay_stained_black")),
+    (62, TileSource::Png("hardened_clay_stained_blue")),
+    (63, TileSource::Png("hardened_clay_stained_brown")),
+    (64, TileSource::Png("hardened_clay_stained_cyan")),
+    (65, TileSource::Png("hardened_clay_stained_gray")),
+    (66, TileSource::Png("hardened_clay_stained_green")),
+    (67, TileSource::Png("hardened_clay_stained_light_blue")),
+    (68, TileSource::Png("hardened_clay_stained_lime")),
+    (69, TileSource::Png("hardened_clay_stained_magenta")),
+    (70, TileSource::Png("hardened_clay_stained_orange")),
+    (71, TileSource::Png("hardened_clay_stained_pink")),
+    (72, TileSource::Png("hardened_clay_stained_purple")),
+    (73, TileSource::Png("hardened_clay_stained_red")),
+    (74, TileSource::Png("hardened_clay_stained_silver")),
+    (75, TileSource::Png("hardened_clay_stained_white")),
+    (76, TileSource::Png("hardened_clay_stained_yellow")),
+    (77, TileSource::Png("cactus_side")),
+];
+
+/// Number of tiles in the atlas — `render-vk` builds the atlas image at this
+/// same tile count (one tile per `ATLAS_TILES` entry, same order), the two
+/// must be changed together.
+pub const ATLAS_TILE_COUNT: u32 = ATLAS_TILES.len() as u32;
 
 /// GPU-ready vertex: world/local-space position, face normal, atlas UV, which
-/// atlas tile to sample, and a flat shading multiplier. No real block
-/// textures exist yet — spec §8 lists sourcing a CC0/GPL texture pack as an
-/// open decision — so `render-vk` fills the atlas with procedurally
-/// generated placeholder tiles instead of loading images. Layout matches the
+/// atlas tile to sample, and a flat shading multiplier. Layout matches the
 /// vertex input state `render-vk`'s pipeline declares — the two must be
 /// changed together.
 #[repr(C)]
@@ -62,8 +157,10 @@ pub const ATLAS_TILE_COUNT: u32 = 16;
 pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
-    /// Unit-square (0/1) corner coordinate *within* the assigned tile — see
-    /// `triangulate`'s doc comment on why a merged quad doesn't tile-repeat.
+    /// Corner coordinate *within* the assigned tile, in block units (not the
+    /// unit square) — see `triangulate`'s doc comment; the shader `fract()`s
+    /// this so the tile repeats once per block on a merged quad instead of
+    /// stretching across the whole face.
     pub uv: [f32; 2],
     /// Which atlas tile (0..ATLAS_TILE_COUNT) to sample; float because
     /// vertex attributes are, resolved to an integer offset in the shader.
@@ -71,11 +168,25 @@ pub struct MeshVertex {
     pub shade: f32,
 }
 
-/// Deterministic atlas tile index per block id — same "hash the id" idea the
-/// old debug-color placeholder used, just indexing into the atlas instead of
-/// picking a flat color directly.
+/// Atlas tile index for a block id — a linear scan of `ATLAS_TILES` (< 100
+/// entries, called per-quad during triangulation; not worth a hash map at
+/// this size). Falls back to tile 0 for a block id with no registered tile,
+/// which shouldn't happen if `blocks.json` and `ATLAS_TILES` are kept in
+/// sync, but a wrong texture beats an out-of-bounds atlas sample.
 fn tile_for_block(block: BlockId) -> f32 {
-    ((block.0 as u32).wrapping_mul(2654435761) % ATLAS_TILE_COUNT) as f32
+    ATLAS_TILES.iter().position(|&(id, _)| id == block.0).unwrap_or(0) as f32
+}
+
+/// A screen-space (NDC, i.e. already `[-1, 1]`, no camera transform applied)
+/// flat-colored vertex — crosshair, inventory swatches. Layout matches
+/// `render-vk`'s UI pipeline's vertex input state; the two must be changed
+/// together.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct UiVertex {
+    pub position: [f32; 2],
+    /// RGBA, 0..1.
+    pub color: [f32; 4],
 }
 
 /// Flat per-face shading: brighter for up-facing quads, darker for
@@ -98,15 +209,36 @@ fn face_shade(normal: [f32; 3]) -> f32 {
 /// `fract()` an unwrapped block-space coordinate instead; deliberately
 /// skipped for this placeholder pass (no real textures to tile yet either),
 /// noted here so it isn't mistaken for an oversight later.
+///
+/// UV spans `0..width`/`0..height` in block units (read straight off the
+/// quad's own corners — a merged quad's edges are exactly its block-space
+/// width/height since the underlying grid is unit blocks), not the unit
+/// square: the shader `fract()`s it before sampling, so the tile repeats
+/// once per block on a merged quad instead of stretching across the whole
+/// face. With real textures (not just a flat placeholder color) a stretched
+/// tile is much more obviously wrong, so this matters more now than it did
+/// with the procedural atlas.
 pub fn triangulate(quads: &[Quad]) -> (Vec<MeshVertex>, Vec<u32>) {
-    const UNIT_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     let mut vertices = Vec::with_capacity(quads.len() * 4);
     let mut indices = Vec::with_capacity(quads.len() * 6);
     for quad in quads {
         let base = vertices.len() as u32;
         let tile = tile_for_block(quad.block);
         let shade = face_shade(quad.normal);
-        for (corner, uv) in quad.corners.into_iter().zip(UNIT_UVS) {
+        let edge = |a: usize, b: usize| {
+            [
+                quad.corners[b][0] - quad.corners[a][0],
+                quad.corners[b][1] - quad.corners[a][1],
+                quad.corners[b][2] - quad.corners[a][2],
+            ]
+        };
+        // Axis-aligned rectangle: exactly one component of each edge vector
+        // is nonzero, so summing absolute components recovers its length.
+        let len = |w: [f32; 3]| w[0].abs() + w[1].abs() + w[2].abs();
+        let width = len(edge(0, 1));
+        let height = len(edge(0, 3));
+        let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]];
+        for (corner, uv) in quad.corners.into_iter().zip(uvs) {
             vertices.push(MeshVertex { position: corner, normal: quad.normal, uv, tile, shade });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -453,14 +585,43 @@ mod tests {
     }
 
     #[test]
-    fn triangulate_uv_is_unit_square_per_corner() {
-        let quad = Quad {
+    fn triangulate_uv_scales_with_merged_quad_size() {
+        // A 1x1 quad still gets the unit square...
+        let unit = Quad {
+            corners: [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]],
+            normal: [0.0, 1.0, 0.0],
+            block: STONE,
+        };
+        let (v, _) = triangulate(&[unit]);
+        let uvs: Vec<_> = v.iter().map(|v| v.uv).collect();
+        assert_eq!(uvs, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+
+        // ...but a 3x2 merged quad's UV spans 0..3 / 0..2, not 0..1 — the
+        // shader `fract()`s this to repeat the tile once per block instead
+        // of stretching it across the whole merged face.
+        let merged = Quad {
             corners: [[0.0, 1.0, 0.0], [3.0, 1.0, 0.0], [3.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
             normal: [0.0, 1.0, 0.0],
             block: STONE,
         };
-        let (vertices, _) = triangulate(&[quad]);
-        let uvs: Vec<_> = vertices.iter().map(|v| v.uv).collect();
-        assert_eq!(uvs, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        let (v, _) = triangulate(&[merged]);
+        let uvs: Vec<_> = v.iter().map(|v| v.uv).collect();
+        assert_eq!(uvs, vec![[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]]);
+    }
+
+    #[test]
+    fn every_atlas_tile_block_id_is_unique() {
+        let mut ids: Vec<u16> = ATLAS_TILES.iter().map(|&(id, _)| id).collect();
+        ids.sort_unstable();
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped, "a block id appears more than once in ATLAS_TILES");
+    }
+
+    #[test]
+    fn tile_for_block_finds_every_registered_block() {
+        for (i, &(id, _)) in ATLAS_TILES.iter().enumerate() {
+            assert_eq!(tile_for_block(BlockId(id)), i as f32, "block id {id}");
+        }
     }
 }
