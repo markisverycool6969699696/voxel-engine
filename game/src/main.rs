@@ -49,7 +49,7 @@ const WORLD_SEED: u64 = 0x5EED_1234;
 /// the full terrain height band (world y 0..127) so a column loads as solid
 /// ground, not a floating surface slice.
 const STREAMING: StreamingConfig = StreamingConfig {
-    load_radius: 7,
+    load_radius: 5,
     unload_margin: 2,
     initial_sections: 0..=7,
     workers: 4,
@@ -784,16 +784,24 @@ impl App {
         self.input.mine_requested = false;
         self.input.place_requested = false;
 
-        // Rebuild (expensive: re-triangulates the world) only when the world
-        // actually changed; upload (also expensive: see MESH_UPLOAD_INTERVAL)
-        // at a bounded rate rather than every frame, so continuous mob motion
-        // can't reintroduce the per-frame GPU stall this replaced.
-        if self.world_mesh_dirty {
-            self.rebuild_world_mesh();
-        }
+        // Rebuild (re-triangulates changed sections, then reassembles the
+        // whole cache into one combined buffer) and upload both happen at
+        // the same throttled rate, not every frame. Reassembly was assumed
+        // cheap when this was first written, but at the current render
+        // distance (~1800 loaded sections) it alone costs ~20ms — copying
+        // every cached section's vertex/index data into a fresh buffer,
+        // *even when nothing changed* — so calling it unthrottled on every
+        // dirty frame (e.g. every block broken while digging) tanked frame
+        // rate. There's no benefit rebuilding more often than we're going to
+        // upload anyway, so both are gated on the same accumulator; mob
+        // motion still re-uploads every window regardless of world_mesh_dirty
+        // (mobs move independent of world edits), same as before.
         self.mesh_upload_accum += dt;
         if self.mesh_upload_accum >= MESH_UPLOAD_INTERVAL {
             self.mesh_upload_accum = 0.0;
+            if self.world_mesh_dirty {
+                self.rebuild_world_mesh();
+            }
             self.upload_combined_mesh();
         }
 
