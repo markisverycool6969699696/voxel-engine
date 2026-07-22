@@ -49,7 +49,7 @@ const WORLD_SEED: u64 = 0x5EED_1234;
 /// the full terrain height band (world y 0..127) so a column loads as solid
 /// ground, not a floating surface slice.
 const STREAMING: StreamingConfig = StreamingConfig {
-    load_radius: 5,
+    load_radius: 4,
     unload_margin: 2,
     initial_sections: 0..=7,
     workers: 4,
