@@ -71,18 +71,6 @@ pub struct MeshVertex {
     pub shade: f32,
 }
 
-/// A screen-space (NDC, i.e. already `[-1, 1]`, no camera transform applied)
-/// flat-colored vertex — crosshair, inventory swatches, menu buttons. Layout
-/// matches `render-vk`'s UI pipeline's vertex input state; the two must be
-/// changed together.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct UiVertex {
-    pub position: [f32; 2],
-    /// RGBA, 0..1.
-    pub color: [f32; 4],
-}
-
 /// Deterministic atlas tile index per block id — same "hash the id" idea the
 /// old debug-color placeholder used, just indexing into the atlas instead of
 /// picking a flat color directly.
@@ -104,33 +92,21 @@ fn face_shade(normal: [f32; 3]) -> f32 {
 /// unique to that quad (no shared-vertex smoothing wanted between
 /// differently-shaded faces anyway).
 ///
-/// UV spans `0..width` and `0..height` in block units (not the unit square)
-/// — the shader `fract()`s it before sampling, so the tile repeats once per
-/// block instead of stretching one tile across the whole merged face. A
-/// merged quad's edges are exactly its block-space width/height since the
-/// underlying grid is unit blocks, so this needs no extra data, just reading
-/// the quad's own corners.
+/// UV is always the unit square per corner regardless of the quad's merged
+/// size — a texture stretches to fill the whole merged face rather than
+/// repeating once per block. Correct per-block tiling needs the shader to
+/// `fract()` an unwrapped block-space coordinate instead; deliberately
+/// skipped for this placeholder pass (no real textures to tile yet either),
+/// noted here so it isn't mistaken for an oversight later.
 pub fn triangulate(quads: &[Quad]) -> (Vec<MeshVertex>, Vec<u32>) {
+    const UNIT_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     let mut vertices = Vec::with_capacity(quads.len() * 4);
     let mut indices = Vec::with_capacity(quads.len() * 6);
     for quad in quads {
         let base = vertices.len() as u32;
         let tile = tile_for_block(quad.block);
         let shade = face_shade(quad.normal);
-        let edge = |a: usize, b: usize| {
-            [
-                quad.corners[b][0] - quad.corners[a][0],
-                quad.corners[b][1] - quad.corners[a][1],
-                quad.corners[b][2] - quad.corners[a][2],
-            ]
-        };
-        // Axis-aligned rectangle: exactly one component of each edge vector
-        // is nonzero, so summing absolute components recovers its length.
-        let len = |w: [f32; 3]| w[0].abs() + w[1].abs() + w[2].abs();
-        let width = len(edge(0, 1));
-        let height = len(edge(0, 3));
-        let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]];
-        for (corner, uv) in quad.corners.into_iter().zip(uvs) {
+        for (corner, uv) in quad.corners.into_iter().zip(UNIT_UVS) {
             vertices.push(MeshVertex { position: corner, normal: quad.normal, uv, tile, shade });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -140,39 +116,9 @@ pub fn triangulate(quads: &[Quad]) -> (Vec<MeshVertex>, Vec<u32>) {
 
 /// Greedy-meshes one section. `is_opaque` decides which blocks emit faces;
 /// faces are emitted where an opaque block meets a non-opaque one.
-pub fn greedy_mesh(section: &PalettedSection, is_opaque: impl Fn(BlockId) -> bool) -> Vec<Quad> {
-    greedy_mesh_with_y_neighbors(section, is_opaque, None, None)
-}
-
-/// Like [`greedy_mesh`], but additionally culls top/bottom (Y-axis) faces at
-/// this section's vertical boundaries against the *real* adjacent section
-/// in the same column when one is given, instead of unconditionally treating
-/// the boundary as exposed.
-///
-/// Without this, every section's top and bottom layer emits faces
-/// regardless of what's actually in the neighboring section — harmless when
-/// that neighbor is solid rock nobody looks at from below, but `SEA_LEVEL`
-/// (64) sits exactly on a section boundary (`64 = 4 * 16`), so the grass/
-/// dirt/water transition that happens right around sea level straddles this
-/// exact seam almost everywhere near the surface: a section's dirt-colored
-/// top layer would render as a visible "phantom" exposed face even where a
-/// real grass block sat directly on top of it in the section above,
-/// completely unrelated to what the terrain actually looked like there.
-/// This was reported as "ground looks like dirt/holes, not grass" and
-/// diagnosed by reproducing the exact generate → mesh pipeline rather than
-/// guessed (see MEMORY.md).
-///
-/// `below`/`above` are the sections immediately below/above this one in the
-/// same column; `None` (not loaded, or the very top/bottom of the world)
-/// falls back to the previous always-exposed behavior. Horizontal (X/Z)
-/// section-boundary culling is unaffected — cross-*column* culling would
-/// need neighbor-column data threaded through streaming, a separate, larger
-/// change than this fix, and stays future work.
-pub fn greedy_mesh_with_y_neighbors(
+pub fn greedy_mesh(
     section: &PalettedSection,
     is_opaque: impl Fn(BlockId) -> bool,
-    below: Option<&PalettedSection>,
-    above: Option<&PalettedSection>,
 ) -> Vec<Quad> {
     let mut quads = Vec::new();
     // Fully non-opaque uniform sections (air) are the overwhelmingly common
@@ -204,26 +150,18 @@ pub fn greedy_mesh_with_y_neighbors(
                         if !is_opaque(block) {
                             continue;
                         }
-                        // pos[0]/pos[2] are always the true x/z regardless of
-                        // axis (only meaningful when axis == 1, guarded below).
                         let exposed = if positive {
-                            if slice + 1 < N {
+                            slice + 1 >= N || {
                                 let mut n = pos;
                                 n[axis] += 1;
                                 !is_opaque(at(n))
-                            } else if axis == 1 {
-                                above.is_none_or(|s| !is_opaque(s.get(pos[0], 0, pos[2])))
-                            } else {
-                                true
                             }
-                        } else if slice > 0 {
-                            let mut n = pos;
-                            n[axis] -= 1;
-                            !is_opaque(at(n))
-                        } else if axis == 1 {
-                            below.is_none_or(|s| !is_opaque(s.get(pos[0], N - 1, pos[2])))
                         } else {
-                            true
+                            slice == 0 || {
+                                let mut n = pos;
+                                n[axis] -= 1;
+                                !is_opaque(at(n))
+                            }
                         };
                         if exposed {
                             mask[v][u] = Some(block);
@@ -403,41 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn y_neighbor_culls_the_phantom_boundary_face() {
-        // A full-stone section with a full-stone section directly above it:
-        // the top layer's up-face must NOT be emitted, because the real
-        // section above completely covers it -- this is exactly the bug
-        // reported as "ground looks like dirt/holes instead of grass" (a
-        // section's top boundary defaulting to "always exposed" even when
-        // the section above it is solid; SEA_LEVEL sits exactly on a
-        // section boundary, so this was visible almost everywhere near the
-        // surface). See MEMORY.md for the full diagnosis.
-        let lower = PalettedSection::filled(STONE);
-        let upper = PalettedSection::filled(STONE);
-        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, None, Some(&upper));
-        let up: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, 1.0, 0.0]).collect();
-        assert!(up.is_empty(), "top face should be culled by the solid section above it");
-
-        // Same section with an AIR section above it (a real gap, e.g. sky):
-        // the up-face must still be emitted.
-        let air_above = PalettedSection::filled(AIR);
-        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, None, Some(&air_above));
-        let up: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, 1.0, 0.0]).collect();
-        assert_eq!(up.len(), 1, "top face must stay exposed when the neighbor is actually open");
-
-        // No neighbor data available (unloaded / world edge): falls back to
-        // the old always-exposed behavior, same as plain `greedy_mesh`.
-        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, None, None);
-        let up: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, 1.0, 0.0]).collect();
-        assert_eq!(up.len(), 1, "must default to exposed when no neighbor section is given");
-
-        // Symmetric check for the bottom boundary against `below`.
-        let quads = greedy_mesh_with_y_neighbors(&lower, opaque, Some(&upper), None);
-        let down: Vec<_> = quads.iter().filter(|q| q.normal == [0.0, -1.0, 0.0]).collect();
-        assert!(down.is_empty(), "bottom face should be culled by the solid section below it");
-    }
-
-    #[test]
     fn flat_slab_top_is_one_quad() {
         let mut s = PalettedSection::filled(AIR);
         for z in 0..16 {
@@ -550,27 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn triangulate_uv_scales_with_merged_quad_size() {
-        // A 1x1 quad still gets the unit square...
-        let unit = Quad {
-            corners: [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]],
-            normal: [0.0, 1.0, 0.0],
-            block: STONE,
-        };
-        let (v, _) = triangulate(&[unit]);
-        let uvs: Vec<_> = v.iter().map(|v| v.uv).collect();
-        assert_eq!(uvs, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
-
-        // ...but a 3x2 merged quad's UV spans 0..3 / 0..2, not 0..1 — the
-        // shader `fract()`s this to repeat the tile once per block instead
-        // of stretching it across the whole merged face.
-        let merged = Quad {
+    fn triangulate_uv_is_unit_square_per_corner() {
+        let quad = Quad {
             corners: [[0.0, 1.0, 0.0], [3.0, 1.0, 0.0], [3.0, 1.0, 2.0], [0.0, 1.0, 2.0]],
             normal: [0.0, 1.0, 0.0],
             block: STONE,
         };
-        let (v, _) = triangulate(&[merged]);
-        let uvs: Vec<_> = v.iter().map(|v| v.uv).collect();
-        assert_eq!(uvs, vec![[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]]);
+        let (vertices, _) = triangulate(&[quad]);
+        let uvs: Vec<_> = vertices.iter().map(|v| v.uv).collect();
+        assert_eq!(uvs, vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
     }
 }

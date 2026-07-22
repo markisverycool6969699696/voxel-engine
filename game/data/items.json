@@ -1,11 +1,6 @@
 [
   { "id": 1, "key": "stone", "stack_size": 64, "places_block": "stone" },
   { "id": 2, "key": "dirt", "stack_size": 64, "places_block": "dirt" },
-  { "id": 3, "key": "grass", "stack_size": 64, "places_block": "grass" },
-  { "id": 4, "key": "sand", "stack_size": 64, "places_block": "sand" },
-  { "id": 5, "key": "wood", "stack_size": 64, "places_block": "wood" },
-  { "id": 6, "key": "leaves", "stack_size": 64, "places_block": "leaves" },
-  { "id": 7, "key": "snow", "stack_size": 64, "places_block": "snow" },
-  { "id": 8, "key": "coal_ore", "stack_size": 64, "places_block": "coal_ore" },
-  { "id": 9, "key": "iron_ore", "stack_size": 64, "places_block": "iron_ore" }
+  { "id": 3, "key": "sand", "stack_size": 64, "places_block": "sand" },
+  { "id": 4, "key": "wood", "stack_size": 64, "places_block": "wood" }
 ]

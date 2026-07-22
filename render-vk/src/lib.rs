@@ -16,12 +16,16 @@
 //! via a descriptor set. Added a depth buffer (recreated alongside the
 //! swapchain) with standard less-than depth testing.
 //!
-//! Back-face culling is enabled (`FrontFace::CLOCKWISE` + `CullModeFlags::BACK`),
-//! paired with `engine_core::camera::VULKAN_CLIP_CORRECTION` being identity
-//! (no clip-space Y-flip) — user-confirmed by screenshot to render right-side
-//! up after a real "upside down" bug (see MEMORY.md for the debugging
-//! history). These two settings move together; changing one without the
-//! other reintroduces either an inside-out or upside-down render.
+//! Back-face culling is **temporarily disabled** (`CullModeFlags::NONE`)
+//! while chasing a real "upside down" rendering bug confirmed by screenshot
+//! (see MEMORY.md and `engine_core::camera`'s doc comment, which just
+//! removed a clip-space Y-negation as the fix). The correct `FrontFace` for
+//! the post-fix pipeline depends on that flip's presence and wasn't
+//! independently derivable with confidence — a first attempt at deriving it
+//! for the *previous* (flipped) state was wrong (see git history), so this
+//! round deliberately isolates the orientation fix from the culling-
+//! direction guess rather than compounding two unconfirmed changes. See the
+//! rasterization state below for the re-enable plan.
 //!
 //! Sync design (the part that must be right):
 //! - `FRAMES_IN_FLIGHT = 2` frames, each with its own command buffer,
@@ -59,7 +63,7 @@ use vk_mem::{Alloc, AllocationCreateFlags, AllocationCreateInfo, Allocator, Allo
 use winit::window::Window;
 
 use engine_core::camera::Camera;
-use engine_core::mesh::{MeshVertex, UiVertex, ATLAS_TILE_COUNT};
+use engine_core::mesh::{MeshVertex, ATLAS_TILE_COUNT};
 use engine_core::Renderer;
 
 mod shader;
@@ -92,46 +96,20 @@ struct GlobalsUbo {
 }
 
 /// Procedurally generates a single-row atlas: `ATLAS_TILE_COUNT` tiles of
-/// Base (undarkened) color for atlas tile `tile`. `engine_core::mesh::
-/// tile_for_block` maps a block id to `id % ATLAS_TILE_COUNT`, which is the
-/// identity for every id below 16 — every block this project currently
-/// defines (see `game/data/blocks.json`) — so tile index and block id
-/// coincide today. Known blocks get a hand-picked, semantically obvious
-/// color instead of a hash: a fully arbitrary hash color made it impossible
-/// to tell "is this water, a hole, or solid ground" at a glance (a real
-/// session report — water hashed to a khaki/tan that read as a flat gray
-/// pit against grass, see MEMORY.md). Unknown tile indices (room for future
-/// block ids up to 15) still fall back to the original hash, so new content
-/// gets *some* distinct color for free without a code change here.
-fn tile_base_color(tile: u32) -> [u8; 3] {
-    match tile {
-        0 => [235, 235, 235],  // air: never actually rendered, kept for completeness
-        1 => [130, 130, 130],  // stone: neutral gray
-        2 => [121, 85, 58],    // dirt: brown
-        3 => [86, 156, 66],    // grass: green
-        4 => [219, 202, 138],  // sand: tan
-        5 => [64, 128, 200],   // water: blue — the specific block this fix is for
-        6 => [117, 84, 51],    // wood: darker brown
-        7 => [58, 122, 48],    // leaves: darker green, distinct from grass
-        8 => [235, 235, 240],  // snow: near-white
-        9 => [40, 40, 40],     // bedrock: near-black
-        10 => [70, 70, 70],    // coal ore: dark gray
-        11 => [176, 148, 120], // iron ore: rusty tan
-        12 => [200, 40, 40],   // mob marker: red (a debug marker, not real terrain)
-        _ => {
-            let h = tile.wrapping_mul(2654435761);
-            [80 + (h & 0x7F) as u8, 80 + ((h >> 8) & 0x7F) as u8, 80 + ((h >> 16) & 0x7F) as u8]
-        }
-    }
-}
-
-/// `ATLAS_TILE_SIZE`² pixels per tile, each `tile_base_color` with a coarse
-/// 4x4 checker so it reads as "textured" rather than a flat swatch.
+/// `ATLAS_TILE_SIZE`² pixels, each a hashed base color with a coarse 4x4
+/// checker so it reads as "textured" rather than a flat swatch — same
+/// "hash the id" idea the pre-atlas debug coloring used, just baked into
+/// pixels instead of a per-vertex color.
 fn generate_atlas_pixels() -> Vec<u8> {
     let (width, height) = (ATLAS_TILE_COUNT * ATLAS_TILE_SIZE, ATLAS_TILE_SIZE);
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for tile in 0..ATLAS_TILE_COUNT {
-        let base = tile_base_color(tile);
+        let h = tile.wrapping_mul(2654435761);
+        let base = [
+            80 + (h & 0x7F) as u8,
+            80 + ((h >> 8) & 0x7F) as u8,
+            80 + ((h >> 16) & 0x7F) as u8,
+        ];
         for y in 0..ATLAS_TILE_SIZE {
             for x in 0..ATLAS_TILE_SIZE {
                 let darker = ((x / 4) + (y / 4)) % 2 == 0;
@@ -215,18 +193,6 @@ pub struct VkRenderer {
     mesh_index_buffer: vk::Buffer,
     mesh_index_allocation: vk_mem::Allocation,
     mesh_index_count: u32,
-
-    // Second, simpler pipeline for screen-space UI (crosshair, inventory,
-    // menus) — no descriptor sets (no camera/atlas needed), no depth test,
-    // alpha blend. Geometry replaced wholesale by `set_ui_mesh`, same
-    // null/0-until-first-call convention as the mesh_* fields above.
-    ui_pipeline_layout: vk::PipelineLayout,
-    ui_pipeline: vk::Pipeline,
-    ui_vertex_buffer: vk::Buffer,
-    ui_vertex_allocation: vk_mem::Allocation,
-    ui_index_buffer: vk::Buffer,
-    ui_index_allocation: vk_mem::Allocation,
-    ui_index_count: u32,
 
     swapchain_dirty: bool,
 }
@@ -384,20 +350,12 @@ impl VkRenderer {
                 mesh_index_buffer: vk::Buffer::null(),
                 mesh_index_allocation: std::mem::zeroed(),
                 mesh_index_count: 0,
-                ui_pipeline_layout: vk::PipelineLayout::null(),
-                ui_pipeline: vk::Pipeline::null(),
-                ui_vertex_buffer: vk::Buffer::null(),
-                ui_vertex_allocation: std::mem::zeroed(),
-                ui_index_buffer: vk::Buffer::null(),
-                ui_index_allocation: std::mem::zeroed(),
-                ui_index_count: 0,
                 swapchain_dirty: false,
             };
             renderer.create_atlas()?;
             renderer.create_globals()?;
             renderer.create_swapchain()?;
             renderer.create_pipeline()?;
-            renderer.create_ui_pipeline()?;
             Ok(renderer)
         }
     }
@@ -741,16 +699,26 @@ impl VkRenderer {
                 .viewport_count(1)
                 .scissor_count(1);
 
-            // Back-face culling, re-enabled now that the user confirmed
-            // orientation renders correctly with `engine_core::camera`'s
-            // clip-space correction as identity (see camera.rs and
-            // MEMORY.md for the debugging history). `CLOCKWISE` pairs with
-            // that state; if geometry ever vanishes or looks inside-out
-            // again, this pair (this value + camera.rs's clip correction)
-            // moves together, never independently.
+            // Culling TEMPORARILY OFF. Context: `engine_core::camera`'s
+            // clip-space Y-flip was just removed to fix a confirmed (by
+            // screenshot) upside-down render — but which `FrontFace` value
+            // pairs correctly with "no flip" wasn't independently derivable
+            // with confidence (see camera.rs's doc comment; the theoretical
+            // model that predicted the *previous* setting was wrong once
+            // already this session). Rather than guess again and risk a
+            // second confusing "still broken, but now for a different
+            // reason" report, cull mode is NONE here so the orientation fix
+            // can be checked in isolation — a fully unculled scene should
+            // just look right-side up (if inefficient), with no separate
+            // culling-direction variable to confuse that check. Once
+            // orientation is confirmed correct, re-enable `CullModeFlags::BACK`
+            // and pick whichever `FrontFace` doesn't make geometry vanish —
+            // that follow-up no longer risks another blind full round-trip
+            // since the harder (orientation) variable will already be pinned
+            // down.
             let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::BACK)
+                .cull_mode(vk::CullModeFlags::NONE)
                 .front_face(vk::FrontFace::CLOCKWISE)
                 .line_width(1.0);
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -809,146 +777,6 @@ impl VkRenderer {
             self.pipeline_layout = layout;
             self.pipeline = pipeline;
             Ok(())
-        }
-    }
-
-    /// Builds the UI overlay pipeline: no descriptor sets (vertices already
-    /// carry NDC position + color, no camera/atlas needed), no depth test
-    /// (always draws on top), straight alpha blending, no culling (a 2D quad
-    /// has no "back"). Same lifetime rules as `create_pipeline` — built once,
-    /// not tied to swapchain recreation.
-    fn create_ui_pipeline(&mut self) -> Result<()> {
-        unsafe {
-            let spirv = shader::compile_wgsl_to_spirv(include_str!("../shaders/ui.wgsl"))?;
-            let module = self.device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&spirv),
-                None,
-            )?;
-
-            let vert_stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(module)
-                .name(c"vs_main");
-            let frag_stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(module)
-                .name(c"fs_main");
-            let stages = [vert_stage, frag_stage];
-
-            let binding_desc = vk::VertexInputBindingDescription::default()
-                .binding(0)
-                .stride(std::mem::size_of::<UiVertex>() as u32)
-                .input_rate(vk::VertexInputRate::VERTEX);
-            let attribute_descs = [
-                vk::VertexInputAttributeDescription::default()
-                    .location(0)
-                    .binding(0)
-                    .format(vk::Format::R32G32_SFLOAT)
-                    .offset(std::mem::offset_of!(UiVertex, position) as u32),
-                vk::VertexInputAttributeDescription::default()
-                    .location(1)
-                    .binding(0)
-                    .format(vk::Format::R32G32B32A32_SFLOAT)
-                    .offset(std::mem::offset_of!(UiVertex, color) as u32),
-            ];
-            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(std::slice::from_ref(&binding_desc))
-                .vertex_attribute_descriptions(&attribute_descs);
-            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-
-            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-            let dynamic_state =
-                vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-                .viewport_count(1)
-                .scissor_count(1);
-
-            let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
-                .polygon_mode(vk::PolygonMode::FILL)
-                .cull_mode(vk::CullModeFlags::NONE)
-                .front_face(vk::FrontFace::CLOCKWISE)
-                .line_width(1.0);
-            let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-            // No depth test: UI always draws on top of the world, regardless
-            // of what's "behind" it in 3D. Depth writes off too — nothing
-            // after this in the same pass depends on UI depth values.
-            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-                .depth_test_enable(false)
-                .depth_write_enable(false)
-                .depth_compare_op(vk::CompareOp::ALWAYS);
-
-            // Straight alpha blend so semi-transparent UI panels are possible
-            // later (menu backgrounds etc.) even though today's callers all
-            // use opaque colors.
-            let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .color_blend_op(vk::BlendOp::ADD)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-                .alpha_blend_op(vk::BlendOp::ADD);
-            let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
-                .attachments(std::slice::from_ref(&blend_attachment));
-
-            // Empty layout: no descriptor sets, no push constants — every
-            // vertex already carries everything the shader needs.
-            let layout = self
-                .device
-                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?;
-
-            let color_formats = [self.swapchain_format.format];
-            let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-                .color_attachment_formats(&color_formats)
-                .depth_attachment_format(self.depth_format);
-
-            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-                .stages(&stages)
-                .vertex_input_state(&vertex_input)
-                .input_assembly_state(&input_assembly)
-                .viewport_state(&viewport_state)
-                .rasterization_state(&rasterization)
-                .multisample_state(&multisample)
-                .depth_stencil_state(&depth_stencil)
-                .color_blend_state(&color_blend)
-                .dynamic_state(&dynamic_state)
-                .layout(layout)
-                .push_next(&mut rendering_info);
-
-            let pipeline = self
-                .device
-                .create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    std::slice::from_ref(&pipeline_info),
-                    None,
-                )
-                .map_err(|(_, e)| e)
-                .context("vkCreateGraphicsPipelines failed (ui)")?[0];
-
-            self.device.destroy_shader_module(module, None);
-
-            self.ui_pipeline_layout = layout;
-            self.ui_pipeline = pipeline;
-            Ok(())
-        }
-    }
-
-    fn destroy_ui_buffers(&mut self) {
-        unsafe {
-            if self.ui_vertex_buffer != vk::Buffer::null() {
-                self.allocator
-                    .destroy_buffer(self.ui_vertex_buffer, &mut self.ui_vertex_allocation);
-                self.ui_vertex_buffer = vk::Buffer::null();
-            }
-            if self.ui_index_buffer != vk::Buffer::null() {
-                self.allocator
-                    .destroy_buffer(self.ui_index_buffer, &mut self.ui_index_allocation);
-                self.ui_index_buffer = vk::Buffer::null();
-            }
         }
     }
 
@@ -1229,23 +1057,6 @@ impl VkRenderer {
                 self.device.cmd_draw_indexed(cmd, self.mesh_index_count, 1, 0, 0, 0);
             }
 
-            // UI overlay, same render pass (dynamic rendering — no need to
-            // end/begin again, just switch pipelines), drawn last so it's on
-            // top; no depth test means draw order alone decides that here.
-            if self.ui_index_count > 0 {
-                self.device
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.ui_pipeline);
-                self.device
-                    .cmd_bind_vertex_buffers(cmd, 0, &[self.ui_vertex_buffer], &[0]);
-                self.device.cmd_bind_index_buffer(
-                    cmd,
-                    self.ui_index_buffer,
-                    0,
-                    vk::IndexType::UINT32,
-                );
-                self.device.cmd_draw_indexed(cmd, self.ui_index_count, 1, 0, 0, 0);
-            }
-
             self.device.cmd_end_rendering(cmd);
 
             // COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC
@@ -1381,33 +1192,6 @@ impl Renderer for VkRenderer {
             Ok(())
         }
     }
-
-    fn set_ui_mesh(&mut self, vertices: &[UiVertex], indices: &[u32]) -> Result<()> {
-        unsafe {
-            // Same device_wait_idle-per-call contract as set_mesh — call
-            // sparingly (on actual UI state changes: opened a menu, hovered
-            // a different slot), never unconditionally every frame.
-            self.device.device_wait_idle()?;
-            self.destroy_ui_buffers();
-
-            if vertices.is_empty() || indices.is_empty() {
-                self.ui_index_count = 0;
-                return Ok(());
-            }
-
-            let (vb, va) = self
-                .create_mapped_buffer_with_data(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)?;
-            let (ib, ia) = self
-                .create_mapped_buffer_with_data(indices, vk::BufferUsageFlags::INDEX_BUFFER)?;
-
-            self.ui_vertex_buffer = vb;
-            self.ui_vertex_allocation = va;
-            self.ui_index_buffer = ib;
-            self.ui_index_allocation = ia;
-            self.ui_index_count = indices.len() as u32;
-            Ok(())
-        }
-    }
 }
 
 impl Drop for VkRenderer {
@@ -1420,12 +1204,7 @@ impl Drop for VkRenderer {
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
 
-            self.device.destroy_pipeline(self.ui_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.ui_pipeline_layout, None);
-
             self.destroy_mesh_buffers();
-            self.destroy_ui_buffers();
 
             for (i, &buffer) in self.uniform_buffers.iter().enumerate() {
                 self.allocator.destroy_buffer(buffer, &mut self.uniform_allocations[i]);

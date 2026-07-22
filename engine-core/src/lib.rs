@@ -28,10 +28,4 @@ pub trait Renderer {
     fn render_frame(&mut self, camera: &camera::Camera) -> anyhow::Result<()>;
     fn resize(&mut self, width: u32, height: u32);
     fn set_mesh(&mut self, vertices: &[mesh::MeshVertex], indices: &[u32]) -> anyhow::Result<()>;
-    /// Replaces the screen-space UI overlay (crosshair, inventory, menus),
-    /// drawn on top of the world mesh every frame with no depth test. Same
-    /// wholesale-replace, call-sparingly contract as `set_mesh` — see its
-    /// docs and the backend's own notes on why this isn't safe to call every
-    /// frame unconditionally.
-    fn set_ui_mesh(&mut self, vertices: &[mesh::UiVertex], indices: &[u32]) -> anyhow::Result<()>;
 }

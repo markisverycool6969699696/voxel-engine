@@ -15,7 +15,7 @@
 
 /// A block type. Plain numeric id; what it *means* (hardness, solidity, …)
 /// lives in the data-driven item/block registry, not here.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub u16);
 
 pub const AIR: BlockId = BlockId(0);
@@ -29,7 +29,7 @@ pub const SECTION_VOLUME: usize = SECTION_DIM * SECTION_DIM * SECTION_DIM;
 const MAX_BITS: u8 = 12;
 
 /// A palette-compressed 16³ block section.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct PalettedSection {
     /// Unique block types present (or once present — see [`Self::compact`]).
     /// `indices` values index into this. Never empty.
@@ -209,7 +209,7 @@ fn bits_for(len: usize) -> u8 {
 /// A vertical column of sections, sparse in y to support vertical streaming:
 /// only generated slices exist; anything absent is implicitly `missing_as`
 /// (air above ground, ungenerated below — callers decide meaning by context).
-#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default)]
 pub struct ChunkColumn {
     sections: std::collections::BTreeMap<i32, PalettedSection>,
 }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use engine_core::camera::Camera;
 use engine_core::chunk::{BlockId, PalettedSection, AIR};
-use engine_core::mesh::{greedy_mesh, greedy_mesh_with_y_neighbors, triangulate, MeshVertex};
+use engine_core::mesh::{greedy_mesh, triangulate, MeshVertex};
 use engine_core::mob::Mob;
 use engine_core::pathfind::{find_path, Cell, NavConfig};
 use engine_core::physics::PlayerController;
@@ -32,8 +32,6 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 mod audio;
 use audio::Audio;
-mod save;
-mod ui;
 
 const SPRINT_MULTIPLIER: f32 = 1.6;
 const MOUSE_SENSITIVITY: f32 = 0.0025;
@@ -52,39 +50,8 @@ const STREAMING: StreamingConfig = StreamingConfig {
     load_radius: 4,
     unload_margin: 2,
     initial_sections: 0..=7,
-    workers: 4,
+    workers: 3,
 };
-
-/// Creative has flight and unrestricted block access (the inventory grid
-/// already shows every registered block regardless of mode); Survival
-/// disables flight. Deliberately not full survival mechanics (no health,
-/// hunger, or mining-yields-drops resource loop) — that's a separate, much
-/// larger feature the user hasn't asked for yet.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum GameMode {
-    Creative,
-    Survival,
-}
-
-/// Pre-gameplay screen shown on launch: pick a fresh Creative/Survival world
-/// or continue the one saved last session. `MainMenu` pauses world/mob/
-/// physics simulation (see `update_and_render`) but the world is already
-/// generated/streamed underneath it — the menu is just a UI overlay + input
-/// gate on top of the same `App`, not a separate app/window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AppState {
-    MainMenu,
-    InGame,
-}
-
-/// Menu options, in display order. `LoadWorld` only appears when a save
-/// file actually exists (see `App::menu_options`).
-#[derive(Clone, Copy, Debug)]
-enum MenuOption {
-    NewCreative,
-    NewSurvival,
-    LoadWorld,
-}
 
 /// Hotbar (number keys 1-4): item ids resolved through the data-driven
 /// `Registry<ItemDef>`/`Registry<BlockDef>` (see `data/items.json`,
@@ -103,20 +70,6 @@ fn block_for_item(items: &Registry<ItemDef>, blocks: &Registry<BlockDef>, item_i
     let block_key = item.places_block.as_deref().expect("hotbar item must place a block");
     let block = blocks.get(block_key).expect("places_block key must exist in blocks.json");
     BlockId(block.id)
-}
-
-/// Every `(item_id, block_id)` pair in the registry that places a block —
-/// the full inventory picker's content. Items with no `places_block` (none
-/// currently exist, but the field is optional) are skipped rather than
-/// panicking, unlike `block_for_item`'s hardcoded hotbar lookups.
-fn inventory_items(items: &Registry<ItemDef>, blocks: &Registry<BlockDef>) -> Vec<(u16, u16)> {
-    items
-        .iter()
-        .filter_map(|item| {
-            let block = blocks.get(item.places_block.as_deref()?)?;
-            Some((item.id, block.id))
-        })
-        .collect()
 }
 
 /// Placeholder mob appearance/size — not a real mob roster, just enough to
@@ -140,14 +93,11 @@ struct MobEntity {
     path: Vec<IVec3>,
     path_idx: usize,
     repath_timer: f32,
-    /// Per-instance walk speed — a little size/speed variety across mobs
-    /// without needing a real species roster.
-    walk_speed: f32,
 }
 
 impl MobEntity {
-    fn new(mob: Mob, walk_speed: f32) -> Self {
-        Self { mob, path: Vec::new(), path_idx: 0, repath_timer: 0.0, walk_speed }
+    fn new(mob: Mob) -> Self {
+        Self { mob, path: Vec::new(), path_idx: 0, repath_timer: 0.0 }
     }
 }
 
@@ -211,10 +161,6 @@ fn world_chunk_of(pos: Vec3) -> (i32, i32) {
 struct Input {
     held: HashSet<KeyCode>,
     mouse_delta: (f64, f64),
-    /// Absolute cursor position in physical pixels — only meaningful (and
-    /// only tracked/used) while the cursor is unlocked, for UI click
-    /// hit-testing. Mouse-look uses `mouse_delta`, not this.
-    cursor_pos: (f64, f64),
     mine_requested: bool,
     place_requested: bool,
 }
@@ -258,16 +204,6 @@ struct App {
     /// — closing the window (Alt+F4 / the X button) still quits via
     /// `WindowEvent::CloseRequested`, unaffected by this.
     cursor_locked: bool,
-    /// `E` toggles this — opens the block picker (frees the cursor to click
-    /// a swatch, closes and re-locks on selection or `Esc`).
-    inventory_open: bool,
-    /// `G` toggles this for now (placeholder until the start menu — task 15
-    /// — lets the player choose it up front instead). Survival forces
-    /// flight off; Creative allows `F` to toggle it as before.
-    game_mode: GameMode,
-    /// Starts at `MainMenu`; a menu click moves it to `InGame` and never
-    /// back (no "return to menu" key exists yet).
-    state: AppState,
 }
 
 impl Default for App {
@@ -292,32 +228,17 @@ impl Default for App {
             .expect("data/items.json must parse");
         let selected_block = block_for_item(&items, &blocks, HOTBAR_ITEM_IDS[0]);
 
-        // A handful of mobs scattered near spawn, each with a little
-        // size/speed variety — still not a real spawning system or species
-        // roster, just enough that "a few wandering/seeking placeholder
-        // mobs" doesn't look like two identical clones.
-        let mob = |wx: i32, wz: i32, seed: u64, size_scale: f32, speed: f32| {
+        // Two mobs placed on the generated surface near spawn — not a
+        // spawning system, just enough to see wander AI working.
+        let mob = |wx: i32, wz: i32, seed: u64| {
             let h = generator.surface_height(wx, wz);
-            let half = (MOB_SIZE * size_scale) / 2.0;
-            MobEntity::new(
-                Mob::new(
-                    Vec3::new(wx as f32 + 0.5, h as f32 + half.y + 0.5, wz as f32 + 0.5),
-                    half,
-                    seed,
-                ),
-                speed,
-            )
+            MobEntity::new(Mob::new(
+                Vec3::new(wx as f32 + 0.5, h as f32 + MOB_SIZE.y / 2.0 + 0.5, wz as f32 + 0.5),
+                MOB_SIZE / 2.0,
+                seed,
+            ))
         };
-        let mobs = vec![
-            mob(12, 8, 1001, 1.0, MOB_WALK_SPEED),
-            mob(5, 12, 2002, 0.85, MOB_WALK_SPEED * 1.3),
-            mob(-10, 6, 3003, 1.2, MOB_WALK_SPEED * 0.8),
-            mob(9, -8, 4004, 0.9, MOB_WALK_SPEED * 1.15),
-            mob(-6, -12, 5005, 1.0, MOB_WALK_SPEED),
-            mob(18, -4, 6006, 0.75, MOB_WALK_SPEED * 1.4),
-            mob(-15, 15, 7007, 1.1, MOB_WALK_SPEED * 0.9),
-            mob(2, 20, 8008, 0.95, MOB_WALK_SPEED * 1.1),
-        ];
+        let mobs = vec![mob(12, 8, 1001), mob(5, 12, 2002)];
 
         Self {
             window: None,
@@ -340,9 +261,6 @@ impl Default for App {
             world_mesh_dirty: true,
             mesh_upload_accum: 0.0,
             cursor_locked: true,
-            inventory_open: false,
-            game_mode: GameMode::Creative,
-            state: AppState::MainMenu,
         }
     }
 }
@@ -362,30 +280,6 @@ impl App {
     /// over however many sections are currently loaded — cheap relative to
     /// greedy-meshing, which is the part this cache actually avoids repeating.
     fn rebuild_world_mesh(&mut self) {
-        // A section's mesh now depends on its vertically-adjacent sections'
-        // data too (see greedy_mesh_with_y_neighbors), not just its own
-        // content. So whenever a section is about to be meshed for the
-        // first time (newly streamed in), any already-cached neighbor above/
-        // below it was meshed assuming "no neighbor" (open boundary) and is
-        // now stale — its top/bottom face may need to disappear now that a
-        // real neighbor exists. Mark those neighbors dirty *before* the main
-        // pass below so they get re-meshed in this same call regardless of
-        // iteration order (the main loop reads live data from `self.chunks`
-        // either way, so re-meshing order within one call doesn't matter,
-        // only whether a section ends up marked dirty before it's visited).
-        for ((cx, cz), column) in self.chunks.columns() {
-            for (sy, _) in column.loaded_sections() {
-                if !self.section_meshes.contains_key(&(cx, sy, cz)) {
-                    for neighbor_sy in [sy - 1, sy + 1] {
-                        let neighbor_key = (cx, neighbor_sy, cz);
-                        if self.section_meshes.contains_key(&neighbor_key) {
-                            self.dirty_sections.insert(neighbor_key);
-                        }
-                    }
-                }
-            }
-        }
-
         let mut still_loaded = HashSet::with_capacity(self.section_meshes.len());
         for ((cx, cz), column) in self.chunks.columns() {
             for (sy, section) in column.loaded_sections() {
@@ -394,17 +288,7 @@ impl App {
                 if self.section_meshes.contains_key(&key) && !self.dirty_sections.contains(&key) {
                     continue; // cached and unchanged
                 }
-                // Pass the real vertically-adjacent sections so a section's
-                // top/bottom boundary faces are culled correctly against
-                // whatever's actually there, instead of always assuming
-                // open air (see greedy_mesh_with_y_neighbors's doc comment —
-                // this was a real, visible bug around sea level specifically).
-                let quads = greedy_mesh_with_y_neighbors(
-                    section,
-                    |b| b != AIR,
-                    column.section(sy - 1),
-                    column.section(sy + 1),
-                );
+                let quads = greedy_mesh(section, |b| b != AIR);
                 let (mut vertices, indices) = triangulate(&quads);
                 let offset = Vec3::new(
                     (cx * SECTION_DIM) as f32,
@@ -444,201 +328,13 @@ impl App {
         let mut vertices = self.world_vertices.clone();
         let mut indices = self.world_indices.clone();
         for entity in &self.mobs {
-            let (mob_vertices, mob_indices) =
-                mob_box_mesh(entity.mob.position, entity.mob.half * 2.0, MOB_BLOCK);
+            let (mob_vertices, mob_indices) = mob_box_mesh(entity.mob.position, MOB_SIZE, MOB_BLOCK);
             let base = vertices.len() as u32;
             indices.extend(mob_indices.into_iter().map(|i| i + base));
             vertices.extend(mob_vertices);
         }
         if let Err(e) = renderer.set_mesh(&vertices, &indices) {
             eprintln!("mesh upload error: {e:#}");
-        }
-    }
-
-    /// Rebuilds and uploads the UI overlay. Call on actual UI state changes
-    /// (window resize, cursor lock toggling the crosshair) — `set_ui_mesh`
-    /// has the same per-call cost as `set_mesh`, never call unconditionally
-    /// every frame.
-    fn rebuild_ui(&mut self) {
-        let Some(renderer) = self.renderer.as_mut() else { return };
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        if self.state == AppState::MainMenu {
-            let entries = Self::menu_entries();
-            let (menu_v, menu_i) = ui::menu_mesh(&entries);
-            indices.extend(menu_i);
-            vertices.extend(menu_v);
-        } else if self.inventory_open {
-            let items = inventory_items(&self.items, &self.blocks);
-            let selected_id = items
-                .iter()
-                .find(|&&(_, block_id)| BlockId(block_id) == self.selected_block)
-                .map(|&(item_id, _)| item_id);
-            let (inv_v, inv_i) = ui::inventory_mesh(&items, selected_id, self.camera.aspect);
-            let base = vertices.len() as u32;
-            indices.extend(inv_i.into_iter().map(|i| i + base));
-            vertices.extend(inv_v);
-        } else if self.cursor_locked {
-            // No crosshair while the cursor is free (nothing to aim at) or
-            // while the inventory covers the screen.
-            let (cross_v, cross_i) = ui::crosshair(self.camera.aspect);
-            let base = vertices.len() as u32;
-            indices.extend(cross_i.into_iter().map(|i| i + base));
-            vertices.extend(cross_v);
-        }
-        if let Err(e) = renderer.set_ui_mesh(&vertices, &indices) {
-            eprintln!("ui mesh upload error: {e:#}");
-        }
-    }
-
-    /// Opens (frees the cursor) or closes (re-locks it) the inventory.
-    fn set_inventory_open(&mut self, open: bool) {
-        self.inventory_open = open;
-        self.set_cursor_lock(!open); // set_cursor_lock already calls rebuild_ui
-    }
-
-    /// Survival forces flight off (falling out of the sky mid-toggle would
-    /// be a jarring way to find out flight got disabled); Creative leaves
-    /// whatever flight state the player already had alone.
-    fn set_game_mode(&mut self, mode: GameMode) {
-        self.game_mode = mode;
-        if mode == GameMode::Survival && self.player.flying {
-            self.player.toggle_flying();
-        }
-    }
-
-    /// `LoadWorld` only appears once a save file actually exists — nothing
-    /// to load on a machine's first-ever launch.
-    fn menu_options() -> Vec<MenuOption> {
-        let mut opts = vec![MenuOption::NewCreative, MenuOption::NewSurvival];
-        if save::save_exists() {
-            opts.push(MenuOption::LoadWorld);
-        }
-        opts
-    }
-
-    fn menu_entries() -> Vec<(&'static str, [f32; 4])> {
-        Self::menu_options()
-            .iter()
-            .map(|opt| match opt {
-                MenuOption::NewCreative => ("CREATIVE", [0.25, 0.7, 0.3, 1.0]),
-                MenuOption::NewSurvival => ("SURVIVAL", [0.75, 0.35, 0.2, 1.0]),
-                MenuOption::LoadWorld => ("LOAD", [0.3, 0.45, 0.8, 1.0]),
-            })
-            .collect()
-    }
-
-    fn handle_menu_click(&mut self) {
-        let Some(window) = &self.window else { return };
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        let ndc_x = (self.input.cursor_pos.0 / size.width as f64) as f32 * 2.0 - 1.0;
-        let ndc_y = (self.input.cursor_pos.1 / size.height as f64) as f32 * 2.0 - 1.0;
-        let options = Self::menu_options();
-        let Some(idx) = ui::menu_hit_test(ndc_x, ndc_y, options.len()) else { return };
-        match options[idx] {
-            MenuOption::NewCreative => self.start_new_world(GameMode::Creative),
-            MenuOption::NewSurvival => self.start_new_world(GameMode::Survival),
-            MenuOption::LoadWorld => self.load_saved_world(),
-        }
-    }
-
-    /// The world is already generated/streamed by the time the menu shows
-    /// (see `resumed`) — "new" just means "use it as-is, ignore any save
-    /// file" rather than actually regenerating anything.
-    fn start_new_world(&mut self, mode: GameMode) {
-        self.set_game_mode(mode);
-        self.state = AppState::InGame;
-        self.set_cursor_lock(true);
-    }
-
-    /// Falls back to a fresh Creative world if the save is missing/corrupt
-    /// rather than leaving the player stuck on a menu option that can't work.
-    fn load_saved_world(&mut self) {
-        let Some(saved) = save::load_world() else {
-            self.start_new_world(GameMode::Creative);
-            return;
-        };
-        // Mark sections dirty *before* handing ownership to `load_saved` —
-        // any of these already loaded (from resumed()'s startup neighborhood)
-        // just got silently overwritten underneath the mesh cache, which
-        // otherwise has no way to know they changed. Also mark their
-        // vertical neighbors: greedy_mesh_with_y_neighbors culls a section's
-        // top/bottom face against the real adjacent section, so an override
-        // can change what an already-cached neighbor's boundary face should
-        // look like too. Unconditional (not just boundary-layer edits, the
-        // way the hot-path set_world_block does it) is fine here — this
-        // runs once at load time, not on every block break.
-        for ((cx, cz), column) in &saved.columns {
-            for (sy, _) in column.loaded_sections() {
-                self.dirty_sections.insert((*cx, sy, *cz));
-                self.dirty_sections.insert((*cx, sy - 1, *cz));
-                self.dirty_sections.insert((*cx, sy + 1, *cz));
-            }
-        }
-        self.chunks.load_saved(saved.columns);
-        self.player.position = Vec3::from_array(saved.player_pos);
-        self.camera.yaw = saved.yaw;
-        self.camera.pitch = saved.pitch;
-        self.set_game_mode(if saved.creative { GameMode::Creative } else { GameMode::Survival });
-
-        // The saved position may be far from wherever resumed()'s startup
-        // load centered on — re-center and give streaming the same bounded
-        // blocking budget so the player doesn't drop into an unloaded void.
-        let center = world_chunk_of(self.player.position);
-        self.streaming_center = Some(center);
-        self.chunks.set_center(center.0, center.1);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while self.chunks.pending() > 0 && Instant::now() < deadline {
-            self.chunks.pump();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        self.chunks.pump();
-
-        self.world_mesh_dirty = true;
-        self.state = AppState::InGame;
-        self.set_cursor_lock(true);
-        self.rebuild_world_mesh();
-        self.upload_combined_mesh();
-    }
-
-    /// Only the diff is saved: currently-loaded modified sections plus
-    /// whatever was already evicted-with-edits earlier this session —
-    /// unmodified terrain regenerates identically from `WORLD_SEED`, so
-    /// there's nothing to gain (and a lot of disk to spend) saving it too.
-    fn save_current_world(&mut self) {
-        let mut columns = self.chunks.drain_evicted_modified();
-        columns.extend(self.chunks.modified_columns());
-        let save = save::WorldSave {
-            seed: WORLD_SEED,
-            creative: self.game_mode == GameMode::Creative,
-            player_pos: self.player.position.to_array(),
-            yaw: self.camera.yaw,
-            pitch: self.camera.pitch,
-            columns,
-        };
-        save::save_world(&save);
-    }
-
-    /// Hit-tests the last known cursor position against the inventory grid;
-    /// selects the block under it and closes the inventory. No-op (leaves
-    /// the inventory open) if the click missed every cell — including the
-    /// dim backdrop, so clicking outside the grid doesn't silently no-op in
-    /// a confusing way, it's just not a hit.
-    fn pick_inventory_item_at_cursor(&mut self) {
-        let Some(window) = &self.window else { return };
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        let ndc_x = (self.input.cursor_pos.0 / size.width as f64) as f32 * 2.0 - 1.0;
-        let ndc_y = (self.input.cursor_pos.1 / size.height as f64) as f32 * 2.0 - 1.0;
-        let items = inventory_items(&self.items, &self.blocks);
-        if let Some(idx) = ui::inventory_hit_test(ndc_x, ndc_y, items.len(), self.camera.aspect) {
-            self.selected_block = BlockId(items[idx].1);
-            self.set_inventory_open(false);
         }
     }
 
@@ -668,7 +364,7 @@ impl App {
 
             if in_range && entity.repath_timer <= 0.0 {
                 entity.repath_timer = MOB_REPATH_INTERVAL;
-                let start = feet_block(entity.mob.position, entity.mob.half.y);
+                let start = feet_block(entity.mob.position, MOB_SIZE.y / 2.0);
                 entity.path = find_path(
                     start,
                     player_feet,
@@ -693,7 +389,7 @@ impl App {
                     entity.mob.steer_toward(delta.x, delta.z);
                 }
             }
-            entity.mob.update(dt, entity.walk_speed, |x, y, z| is_solid_in(chunks, x, y, z));
+            entity.mob.update(dt, MOB_WALK_SPEED, |x, y, z| is_solid_in(chunks, x, y, z));
         }
     }
 
@@ -704,20 +400,6 @@ impl App {
             .map(|prev| (now - prev).as_secs_f32())
             .unwrap_or(0.0);
         self.last_frame = Some(now);
-
-        if self.state == AppState::MainMenu {
-            // Paused: no physics/streaming/mobs, just present whatever the
-            // last frame already had underneath the menu overlay.
-            if let Some(renderer) = self.renderer.as_mut() {
-                if let Err(e) = renderer.render_frame(&self.camera) {
-                    eprintln!("render error: {e:#}");
-                }
-            }
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
-            return;
-        }
 
         // While the cursor is freed (Esc), the game keeps simulating (world
         // streaming, mobs, gravity) but ignores mouse-look/movement/mine-place
@@ -784,24 +466,16 @@ impl App {
         self.input.mine_requested = false;
         self.input.place_requested = false;
 
-        // Rebuild (re-triangulates changed sections, then reassembles the
-        // whole cache into one combined buffer) and upload both happen at
-        // the same throttled rate, not every frame. Reassembly was assumed
-        // cheap when this was first written, but at the current render
-        // distance (~1800 loaded sections) it alone costs ~20ms — copying
-        // every cached section's vertex/index data into a fresh buffer,
-        // *even when nothing changed* — so calling it unthrottled on every
-        // dirty frame (e.g. every block broken while digging) tanked frame
-        // rate. There's no benefit rebuilding more often than we're going to
-        // upload anyway, so both are gated on the same accumulator; mob
-        // motion still re-uploads every window regardless of world_mesh_dirty
-        // (mobs move independent of world edits), same as before.
+        // Rebuild (expensive: re-triangulates the world) only when the world
+        // actually changed; upload (also expensive: see MESH_UPLOAD_INTERVAL)
+        // at a bounded rate rather than every frame, so continuous mob motion
+        // can't reintroduce the per-frame GPU stall this replaced.
+        if self.world_mesh_dirty {
+            self.rebuild_world_mesh();
+        }
         self.mesh_upload_accum += dt;
         if self.mesh_upload_accum >= MESH_UPLOAD_INTERVAL {
             self.mesh_upload_accum = 0.0;
-            if self.world_mesh_dirty {
-                self.rebuild_world_mesh();
-            }
             self.upload_combined_mesh();
         }
 
@@ -853,26 +527,13 @@ impl App {
             (world.x.rem_euclid(SECTION_DIM) as usize, world.z.rem_euclid(SECTION_DIM) as usize);
         let edited = self.chunks.set_block(cx, cz, lx, world.y, lz, block);
         if edited {
-            // The edited section always needs re-meshing. Its vertical
-            // neighbors only need it if the edit actually touched this
-            // section's own top or bottom layer (local y 15 or 0) —
-            // greedy_mesh_with_y_neighbors culls a section's boundary face
-            // against the real adjacent section, so only an edit *at* that
-            // boundary can change what the neighbor's boundary face should
-            // look like. Marking neighbors dirty unconditionally on every
-            // edit (an earlier version of this fix did that) tripled the
-            // greedy-mesh cost of every single block break/place — the vast
-            // majority of edits are nowhere near a section boundary and
-            // don't need it, and that was a real, reported lag regression
-            // (see MEMORY.md).
+            // Each section's mesh only depends on its own content (greedy_mesh
+            // never looks across section boundaries — a solid block at a
+            // section's own top/bottom slice is always treated as exposed
+            // there regardless of the neighbor), so only this one section
+            // needs re-meshing, not the whole world.
             let sy = world.y.div_euclid(SECTION_DIM);
-            let ly = world.y.rem_euclid(SECTION_DIM);
             self.dirty_sections.insert((cx, sy, cz));
-            if ly == 0 {
-                self.dirty_sections.insert((cx, sy - 1, cz));
-            } else if ly == SECTION_DIM - 1 {
-                self.dirty_sections.insert((cx, sy + 1, cz));
-            }
             self.world_mesh_dirty = true;
         }
         edited
@@ -894,7 +555,6 @@ impl App {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             window.set_cursor_visible(true);
         }
-        self.rebuild_ui(); // crosshair only shows while locked
     }
 }
 
@@ -925,6 +585,14 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
+        // Mouse-look: hide the cursor and keep it from leaving the window.
+        // `Locked` (recenters every frame) is nicer but not universally
+        // supported; fall back to `Confined` rather than failing outright.
+        if window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+        }
+        window.set_cursor_visible(false);
+
         let size = window.inner_size();
         if size.width > 0 && size.height > 0 {
             self.camera.aspect = size.width as f32 / size.height as f32;
@@ -951,53 +619,27 @@ impl ApplicationHandler for App {
 
         self.rebuild_world_mesh();
         self.upload_combined_mesh();
-        // Cursor starts free/visible — the main menu needs it clickable.
-        // `set_cursor_lock(true)` (mouse-look grab) only happens once the
-        // player actually picks a menu option and enters `AppState::InGame`.
-        // Also calls `rebuild_ui` for us, which now shows the menu since
-        // `state` is still `MainMenu` at this point.
-        self.set_cursor_lock(false);
         self.mesh_upload_accum = 0.0;
         self.last_frame = Some(Instant::now());
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                if self.state == AppState::InGame {
-                    self.save_current_world();
-                }
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(size.width, size.height);
                 }
                 if size.width > 0 && size.height > 0 {
                     self.camera.aspect = size.width as f32 / size.height as f32;
-                    self.rebuild_ui(); // crosshair shape depends on aspect
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
-                if self.state == AppState::MainMenu {
-                    // Menu input is mouse-only; keyboard has nothing to do
-                    // (in particular Escape/E must not touch cursor lock —
-                    // the menu needs the free cursor to be clickable).
-                    return;
-                }
                 if code == KeyCode::Escape && event.state == ElementState::Pressed {
-                    if self.inventory_open {
-                        self.set_inventory_open(false);
-                    } else {
-                        // Free the cursor instead of quitting — Alt+F4 / the
-                        // window's close button still quit normally.
-                        self.set_cursor_lock(!self.cursor_locked);
-                    }
-                    return;
-                }
-                if code == KeyCode::KeyE && event.state == ElementState::Pressed {
-                    self.set_inventory_open(!self.inventory_open);
+                    // Free the cursor instead of quitting — Alt+F4 / the
+                    // window's close button still quit normally.
+                    self.set_cursor_lock(!self.cursor_locked);
                     return;
                 }
                 if event.state == ElementState::Pressed {
@@ -1012,14 +654,8 @@ impl ApplicationHandler for App {
                         self.selected_block =
                             block_for_item(&self.items, &self.blocks, HOTBAR_ITEM_IDS[slot]);
                     }
-                    if code == KeyCode::KeyF && self.game_mode == GameMode::Creative {
+                    if code == KeyCode::KeyF {
                         self.player.toggle_flying();
-                    }
-                    if code == KeyCode::KeyG {
-                        self.set_game_mode(match self.game_mode {
-                            GameMode::Creative => GameMode::Survival,
-                            GameMode::Survival => GameMode::Creative,
-                        });
                     }
                 }
                 match event.state {
@@ -1031,19 +667,8 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.input.cursor_pos = (position.x, position.y);
-            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
-                if self.state == AppState::MainMenu {
-                    if button == MouseButton::Left {
-                        self.handle_menu_click();
-                    }
-                } else if self.inventory_open {
-                    if button == MouseButton::Left {
-                        self.pick_inventory_item_at_cursor();
-                    }
-                } else if !self.cursor_locked {
+                if !self.cursor_locked {
                     // Click back into the window to resume, instead of that
                     // click registering as mine/place.
                     self.set_cursor_lock(true);
